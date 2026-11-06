@@ -42,6 +42,12 @@ file properties (Properties > Details, publisher Verbose Software) read it.
 `docs/CHANGELOG.md` holds the public notes, one `## <version>` section per
 release; `build.ps1` refuses to build without one. Tag each release `v<version>`.
 
+Releases are built by GitHub Actions (`.github/workflows/build.yml`): every push
+runs the tests on Windows, and a pushed `v<version>` tag also checks the tag
+matches `Cargo.toml`, runs `build.ps1` and publishes a release with the exe and
+that version's changelog section as the notes. Tags with `-beta.N` / `-rc.N`
+become pre-releases.
+
 ## Icon
 
 `assets/app.ico` (stamped into the exe by `build.rs`) and `assets/icon-256.png`

@@ -9,6 +9,11 @@ punctuation only.
 
 Newest first. Each heading is `## <version>` and must match `version` in `Cargo.toml`.
 
+## 0.2.1
+
+- Open source under the MIT license.
+- The exe is now built on GitHub, and each release lists its SHA-256.
+
 ## 0.2.0
 
 - Sort by any column: click a column header (Time, Source, Device, User, Event, Value, Previous);

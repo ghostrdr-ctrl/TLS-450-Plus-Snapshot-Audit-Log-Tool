@@ -1,0 +1,79 @@
+name: Build
+
+# Every push and pull request: run the tests on Windows.
+# A pushed tag v<version>: also build the exe with build.ps1 and publish a
+# release with that version's section of docs/CHANGELOG.md as the notes.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            C:/build/TLS-450-Plus-Snapshot-Audit-Log-Tool
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Check the tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") {
+            throw "Tag ${{ github.ref_name }} does not match Cargo.toml version $version"
+          }
+
+      - name: Build the exe
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.Substring(1)
+          # This version's section of the changelog, without its heading.
+          $notes = @(); $inside = $false
+          foreach ($line in Get-Content docs/CHANGELOG.md) {
+            if ($line -match '^## ') {
+              if ($inside) { break }
+              $inside = ($line -eq "## $version")
+              continue
+            }
+            if ($inside) { $notes += $line }
+          }
+          $exe = "dist/TLS-450-Plus-Snapshot-Audit-Log-Tool.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          $notes += ""
+          $notes += "SHA-256 of the exe: ``$hash``"
+          $notes -join "`n" | Set-Content -Encoding utf8 notes.md
+          $extra = @()
+          if ($version -match '-') { $extra += "--prerelease" }
+          gh release create $tag $exe --title "TLS-450 Plus Snapshot Audit Log Tool $version" --notes-file notes.md @extra
