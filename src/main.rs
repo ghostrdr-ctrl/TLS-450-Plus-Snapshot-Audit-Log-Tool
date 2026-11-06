@@ -7,9 +7,12 @@
 #[cfg(feature = "review-shots")]
 mod shots;
 mod snapshot;
+mod update;
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 
 use eframe::egui::{self, Align, Color32, Key, Label, Layout, Modifiers, RichText, TextEdit};
@@ -167,8 +170,38 @@ struct App {
     /// Opened at start because it was the newest snapshot next to the program.
     auto_opened: bool,
     focus_search: bool,
+    update: UpdateState,
     #[cfg(feature = "review-shots")]
     shots: Option<shots::Shots>,
+}
+
+/// The update check and install, shown as a strip above the toolbar.
+enum UpdateState {
+    Idle,
+    /// `manual`: started from the button, so "up to date" and errors are reported.
+    Checking {
+        manual: bool,
+        rx: Receiver<Result<update::Check, String>>,
+    },
+    /// A newer version: the strip offers it until Later.
+    Available(update::Release),
+    Downloading {
+        release: update::Release,
+        rx: Receiver<Download>,
+        cancel: Arc<AtomicBool>,
+        done: u64,
+        total: u64,
+    },
+    /// The update did not go through; the installed program is unchanged.
+    Failed {
+        release: update::Release,
+        error: String,
+    },
+}
+
+enum Download {
+    Progress(u64, u64),
+    Done(Result<PathBuf, String>),
 }
 
 impl App {
@@ -191,9 +224,21 @@ impl App {
             loading: None,
             auto_opened: false,
             focus_search: false,
+            update: UpdateState::Idle,
             #[cfg(feature = "review-shots")]
             shots: shots::Shots::from_env(),
         };
+        if let Ok(exe) = std::env::current_exe() {
+            update::clean_up_old(&exe);
+        }
+        // A quiet check at start; screenshot runs stay offline.
+        #[cfg(feature = "review-shots")]
+        let check_now = app.shots.is_none();
+        #[cfg(not(feature = "review-shots"))]
+        let check_now = true;
+        if check_now {
+            app.start_check(false);
+        }
         match arg {
             Some(p) => app.open(&p),
             None => {
@@ -204,6 +249,186 @@ impl App {
             }
         }
         app
+    }
+
+    fn start_check(&mut self, manual: bool) {
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(update::check(APP_VERSION));
+        });
+        self.update = UpdateState::Checking { manual, rx };
+    }
+
+    fn update_busy(&self) -> bool {
+        matches!(self.update, UpdateState::Checking { .. } | UpdateState::Downloading { .. })
+    }
+
+    /// The user said yes: check the folder can be written, then download on a thread.
+    fn start_download(&mut self, release: update::Release) {
+        let Some(asset) = release.asset.clone() else { return };
+        let dir = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+        let Some(dir) = dir.filter(|d| update::can_write_to(d)) else {
+            self.update = UpdateState::Failed {
+                release,
+                error: "this program's folder can't be written to, so it can't replace itself. \
+                        Download the new version from the releases page instead."
+                    .into(),
+            };
+            return;
+        };
+        let (tx, rx) = channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        std::thread::spawn(move || {
+            let progress = |done, total| {
+                let _ = tx.send(Download::Progress(done, total));
+            };
+            let r = update::download(&asset, APP_VERSION, &dir, &progress, &stop);
+            let _ = tx.send(Download::Done(r));
+        });
+        let total = release.asset.as_ref().map_or(0, |a| a.size);
+        self.update = UpdateState::Downloading {
+            release,
+            rx,
+            cancel,
+            done: 0,
+            total,
+        };
+    }
+
+    /// Takes finished checks and download progress.
+    fn poll_update(&mut self, ctx: &egui::Context) {
+        match &mut self.update {
+            UpdateState::Checking { manual, rx } => {
+                let manual = *manual;
+                let Ok(r) = rx.try_recv() else { return };
+                self.update = UpdateState::Idle;
+                match r {
+                    Ok(update::Check::Available(rel)) => self.update = UpdateState::Available(rel),
+                    Ok(update::Check::UpToDate(_)) if manual => {
+                        self.message = Message::Good(format!("You have the latest version ({APP_VERSION})."));
+                    }
+                    Err(e) if manual => self.message = error(format!("Update check failed: {e}")),
+                    _ => {}
+                }
+            }
+            UpdateState::Downloading {
+                release, rx, done, total, ..
+            } => {
+                let mut finished = None;
+                while let Ok(m) = rx.try_recv() {
+                    match m {
+                        Download::Progress(d, t) => (*done, *total) = (d, t),
+                        Download::Done(r) => finished = Some(r),
+                    }
+                }
+                let Some(r) = finished else { return };
+                let release = release.clone();
+                match r {
+                    Err(e) if e == "cancelled" => self.update = UpdateState::Available(release),
+                    Err(e) => self.update = UpdateState::Failed { release, error: e },
+                    Ok(tmp) => self.install(ctx, release, &tmp),
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Swap the verified download in and start it, reopening the same snapshot.
+    fn install(&mut self, ctx: &egui::Context, release: update::Release, tmp: &Path) {
+        let swapped = std::env::current_exe()
+            .map_err(|e| format!("could not find this program ({e})"))
+            .and_then(|exe| update::swap_in(&exe, tmp).map(|_| exe));
+        let exe = match swapped {
+            Ok(exe) => exe,
+            Err(e) => {
+                let _ = std::fs::remove_file(tmp);
+                self.update = UpdateState::Failed { release, error: e };
+                return;
+            }
+        };
+        let mut cmd = std::process::Command::new(&exe);
+        if let Some(d) = &self.data {
+            cmd.arg(&d.path);
+        }
+        match cmd.spawn() {
+            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Err(e) => {
+                self.update = UpdateState::Idle;
+                self.message = error(format!(
+                    "Updated to {}, but it could not be started ({e}). Close this window and start the program again.",
+                    release.version
+                ));
+            }
+        }
+    }
+
+    /// The strip above the toolbar while an update is offered or running.
+    fn update_strip(&mut self, ui: &mut egui::Ui) {
+        let mut next: Option<UpdateState> = None;
+        let mut install: Option<update::Release> = None;
+        let notes_tip = |r: &update::Release| {
+            let n: String = r.notes.trim().chars().take(1500).collect();
+            if n.is_empty() {
+                "Opens the release page".to_string()
+            } else {
+                format!("{n}\n\nClick to open the release page.")
+            }
+        };
+        ui.horizontal_wrapped(|ui| match &self.update {
+            UpdateState::Available(r) => {
+                ui.label(RichText::new(format!("Version {} is available", r.version)).strong().color(BLUE));
+                ui.label(format!("(you have {APP_VERSION})."));
+                if r.asset.is_some() {
+                    if ui
+                        .button("Update and restart")
+                        .on_hover_text("Downloads the new version from GitHub, checks it, replaces this program and starts it again")
+                        .clicked()
+                    {
+                        install = Some(r.clone());
+                    }
+                } else if ui.button("Open download page").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(update::RELEASES_PAGE));
+                }
+                if ui.button("What's new").on_hover_text(notes_tip(r)).clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(update::RELEASES_PAGE));
+                }
+                if ui.button("Later").clicked() {
+                    next = Some(UpdateState::Idle);
+                }
+            }
+            UpdateState::Downloading {
+                release,
+                cancel,
+                done,
+                total,
+                ..
+            } => {
+                ui.spinner();
+                let pct = if *total > 0 { done * 100 / total } else { 0 };
+                ui.label(format!("Downloading version {}... {pct}%", release.version));
+                if ui.button("Cancel").clicked() {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+            UpdateState::Failed { release, error } => {
+                ui.label(RichText::new(format!("Update to {} failed: {error}", release.version)).color(RED));
+                ui.label("This version is unchanged.");
+                if ui.button("Open download page").clicked() {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(update::RELEASES_PAGE));
+                }
+                if ui.button("Close").clicked() {
+                    next = Some(UpdateState::Idle);
+                }
+            }
+            _ => {}
+        });
+        if let Some(n) = next {
+            self.update = n;
+        }
+        if let Some(r) = install {
+            self.start_download(r);
+        }
     }
 
     /// Starts loading a snapshot on a background thread.
@@ -935,6 +1160,7 @@ impl App {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let mut check_clicked = false;
         ui.horizontal(|ui| {
             if let Some((p, _)) = &self.loading {
                 ui.spinner();
@@ -973,18 +1199,37 @@ impl App {
                 }
                 None => {}
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| match &self.message {
-                Message::None => {}
-                Message::Good(m) => {
-                    ui.add(Label::new(RichText::new(m).color(GREEN)).truncate()).on_hover_text(m);
-                    ui.separator();
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let busy = self.update_busy();
+                let checking = matches!(self.update, UpdateState::Checking { manual: true, .. });
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Check for updates").small())
+                    .on_hover_text(format!("Version {APP_VERSION}. Looks for a newer release on GitHub."))
+                    .clicked()
+                {
+                    check_clicked = true;
                 }
-                Message::Error(short, long) => {
-                    ui.add(Label::new(RichText::new(short).color(RED)).truncate()).on_hover_text(long);
-                    ui.separator();
+                if checking {
+                    ui.spinner();
+                }
+                ui.separator();
+                match &self.message {
+                    Message::None => {}
+                    Message::Good(m) => {
+                        ui.add(Label::new(RichText::new(m).color(GREEN)).truncate()).on_hover_text(m);
+                        ui.separator();
+                    }
+                    Message::Error(short, long) => {
+                        ui.add(Label::new(RichText::new(short).color(RED)).truncate()).on_hover_text(long);
+                        ui.separator();
+                    }
                 }
             });
         });
+        if check_clicked {
+            self.message = Message::None;
+            self.start_check(true);
+        }
     }
 }
 
@@ -995,7 +1240,8 @@ impl eframe::App for App {
 
         let ctx = ui.ctx().clone();
         self.poll_loading();
-        if self.loading.is_some() {
+        self.poll_update(&ctx);
+        if self.loading.is_some() || self.update_busy() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
 
@@ -1047,6 +1293,16 @@ impl eframe::App for App {
         }
 
         self.refilter();
+        if matches!(
+            self.update,
+            UpdateState::Available(_) | UpdateState::Downloading { .. } | UpdateState::Failed { .. }
+        ) {
+            egui::Panel::top("update").show(ui, |ui| {
+                egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 6)).show(ui, |ui| {
+                    self.update_strip(ui);
+                });
+            });
+        }
         egui::Panel::top("controls").show(ui, |ui| {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 8)).show(ui, |ui| {
                 self.toolbar(ui, &ctx);

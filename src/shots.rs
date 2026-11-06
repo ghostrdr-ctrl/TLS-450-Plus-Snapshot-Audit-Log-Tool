@@ -99,9 +99,32 @@ const STATES: &[(&str, Setup)] = &[
         a.click_row(0, false, false);
         a.click_row(5, true, false);
     }),
+    ("12c-update-available", |a, ctx| {
+        ctx.set_theme(egui::Theme::Dark);
+        a.selected.clear();
+        a.update = crate::UpdateState::Available(crate::update::Release {
+            version: "9.9.0".into(),
+            notes: "- An example change\n- Another one".into(),
+            asset: Some(crate::update::Asset {
+                url: String::new(),
+                size: 9_000_000,
+                sha256: [0; 32],
+            }),
+        });
+    }),
+    ("12d-update-failed", |a, _| {
+        let crate::UpdateState::Available(r) = std::mem::replace(&mut a.update, crate::UpdateState::Idle) else {
+            return;
+        };
+        a.update = crate::UpdateState::Failed {
+            release: r,
+            error: "the download does not match its published SHA-256".into(),
+        };
+    }),
     ("13-no-snapshot-open", |a, ctx| {
         ctx.set_theme(egui::Theme::Dark);
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1280.0, 780.0)));
+        a.update = crate::UpdateState::Idle;
         a.data = None;
         a.shown.clear();
         a.shown_for = None;

@@ -48,6 +48,13 @@ matches `Cargo.toml`, runs `build.ps1` and publishes a release with the exe and
 that version's changelog section as the notes. Tags with `-beta.N` / `-rc.N`
 become pre-releases.
 
+The in-app updater (`src/update.rs`) reads
+`https://api.github.com/repos/ghostrdr-ctrl/TLS-450-Plus-Snapshot-Audit-Log-Tool/releases/latest`
+and installs only an asset named exactly `TLS-450-Plus-Snapshot-Audit-Log-Tool.exe` from that
+repo's release downloads, with a SHA-256 (GitHub's asset digest, or the line the workflow writes
+in the notes). Keep the asset name and that notes line when changing the workflow.
+Pre-releases are never offered.
+
 ## Icon
 
 `assets/app.ico` (stamped into the exe by `build.rs`) and `assets/icon-256.png`

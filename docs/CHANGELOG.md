@@ -9,6 +9,13 @@ punctuation only.
 
 Newest first. Each heading is `## <version>` and must match `version` in `Cargo.toml`.
 
+## 0.3.0
+
+- Updates: at start the program checks GitHub for a newer version and offers it in a strip above
+  the toolbar. "Update and restart" downloads it, checks its SHA-256, replaces the program and
+  reopens the same snapshot. Nothing is downloaded unless you click it.
+- "Check for updates" at the bottom right checks on demand.
+
 ## 0.2.1
 
 - Open source under the MIT license.
