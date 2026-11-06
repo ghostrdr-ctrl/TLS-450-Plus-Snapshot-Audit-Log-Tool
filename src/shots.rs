@@ -18,7 +18,46 @@ const STATES: &[(&str, Setup)] = &[
         a.quick_range(Preset::Week);
         a.filters.search = "leak".into();
     }),
-    ("03-device-tank-1", |a, _| {
+    ("02b-all-kinds-ticked", |a, _| {
+        a.filters.search.clear();
+        a.quick_range(Preset::All);
+        a.filters.kinds = [true; crate::Kind::COUNT];
+    }),
+    ("02c-no-kinds-ticked", |a, _| {
+        a.filters.kinds = [false; crate::Kind::COUNT];
+    }),
+    ("02d-only-line-tests-and-diagnostics", |a, _| {
+        a.filters.kinds[crate::Kind::LineTest.index()] = true;
+        a.filters.kinds[crate::Kind::LineDiag.index()] = true;
+    }),
+    ("02e-search-phrase-and-exclusion", |a, _| {
+        a.filters.kinds = crate::kind::defaults();
+        a.filters.search = r#""line out" -acknowledged"#.into();
+    }),
+    ("02f-dark-program-logs-week", |a, ctx| {
+        ctx.set_theme(egui::Theme::Dark);
+        a.filters.search.clear();
+        a.quick_range(Preset::Week);
+        a.filters.kinds = [false; crate::Kind::COUNT];
+        a.filters.kinds[crate::Kind::ProgramLog.index()] = true;
+        a.filters.kinds[crate::Kind::Power.index()] = true;
+        a.filters.kinds[crate::Kind::AppLog.index()] = true;
+    }),
+    ("02g-dark-all-kinds-tags", |a, _| {
+        a.quick_range(Preset::Day);
+        a.filters.kinds = [true; crate::Kind::COUNT];
+    }),
+    ("02h-user-chosen-then-audit-unticked", |a, ctx| {
+        ctx.set_theme(egui::Theme::Light);
+        a.quick_range(Preset::All);
+        a.filters.kinds = crate::kind::defaults();
+        a.filters.user = a.users.first().cloned().unwrap_or_default();
+        a.filters.kinds[crate::Kind::Audit.index()] = false;
+    }),
+    ("03-device-tank-1", |a, ctx| {
+        a.filters.user.clear();
+        ctx.set_theme(egui::Theme::Light);
+        a.filters.kinds = crate::kind::defaults();
         a.filters.search.clear();
         a.refilter();
         a.filters.device = a.devices.iter().find(|d| d.starts_with("Tank 1")).cloned().unwrap_or_default();
@@ -26,11 +65,11 @@ const STATES: &[(&str, Setup)] = &[
     ("04-automatic-tests-on-oldest-first", |a, _| {
         a.filters.device.clear();
         a.quick_range(Preset::All);
-        a.filters.auto_tests = true;
+        a.filters.kinds[crate::Kind::AutoTest.index()] = true;
         a.filters.sort = crate::Sort { col: 0, desc: false };
     }),
     ("05-invalid-from-time", |a, _| {
-        a.filters.auto_tests = false;
+        a.filters.kinds = crate::kind::defaults();
         a.filters.sort = crate::Sort::default();
         a.filters.from = "2026-13-45 25:00".into();
         a.filters.preset = Preset::Custom;
@@ -64,7 +103,7 @@ const STATES: &[(&str, Setup)] = &[
         let row = a.data.as_ref().and_then(|d| {
             d.rows
                 .iter()
-                .position(|r| r.event == "Manual static leak test started" && r.device.starts_with("Tank 1"))
+                .position(|r| r.event.ends_with("static leak test started") && r.device.starts_with("Tank 1"))
         });
         if let Some(r) = row {
             a.show_around(r);
@@ -74,7 +113,7 @@ const STATES: &[(&str, Setup)] = &[
         let row = a.data.as_ref().and_then(|d| {
             d.rows
                 .iter()
-                .position(|r| r.event == "Manual static leak test started" && r.device.starts_with("Tank 1"))
+                .position(|r| r.event.ends_with("static leak test started") && r.device.starts_with("Tank 1"))
         });
         if let Some(r) = row {
             a.select_around(r);
@@ -85,7 +124,16 @@ const STATES: &[(&str, Setup)] = &[
         a.quick_range(Preset::Week);
         a.filters.sort = crate::Sort { col: 3, desc: false };
     }),
-    ("12-narrow-window", |a, ctx| {
+    ("12-narrow-window-panel-folded", |a, ctx| {
+        a.show_panel = false;
+        a.filters.sort = crate::Sort::default();
+        a.selected.clear();
+        a.quick_range(Preset::All);
+        a.message = Message::None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(860.0, 560.0)));
+    }),
+    ("12a-narrow-window", |a, ctx| {
+        a.show_panel = true;
         a.filters.sort = crate::Sort::default();
         a.selected.clear();
         a.quick_range(Preset::All);
@@ -93,6 +141,7 @@ const STATES: &[(&str, Setup)] = &[
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(860.0, 560.0)));
     }),
     ("12b-light-mode-selected", |a, ctx| {
+        a.show_panel = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1280.0, 780.0)));
         ctx.set_theme(egui::Theme::Light);
         a.refilter();
@@ -129,6 +178,8 @@ const STATES: &[(&str, Setup)] = &[
         a.shown.clear();
         a.shown_for = None;
         a.filters = Default::default();
+        a.totals = [0; crate::Kind::COUNT];
+        a.counts = [0; crate::Kind::COUNT];
         a.message = Message::None;
     }),
 ];

@@ -9,6 +9,30 @@ punctuation only.
 
 Newest first. Each heading is `## <version>` and must match `version` in `Cargo.toml`.
 
+## 0.4.0
+
+- Every log in the snapshot, not just the audit trail, alarms and static leak tests: log
+  management, the alarm period report, CSLD, line leak (PLLD) tests and their diagnostics,
+  compliance records, deliveries, inventory and shift closes, power off and on, the application
+  log, auto events, ISD records and the console's program log files. 17 kinds in all.
+- A Show panel on the left: a tick box for each kind, in groups, with how many rows of each match
+  the other filters. Defaults, All and None buttons, an all/none link per group, and right-click
+  or Alt+click to show only one kind. Hide folds it away; it folds itself on a narrow window.
+- Log management entries that repeat an audit row are shown once while the audit trail is ticked.
+- Static leak tests show their test type, start volume and result.
+- Search: "quoted phrases" and -words to leave rows out.
+- User and Device lists have a box to narrow them as you type. A choice is kept when its kinds are
+  unticked, and marked.
+- The status bar says how many more rows match in kinds not ticked; an empty table says why and
+  offers the fix.
+- "Back to previous filters" after "Show all events within 15 min".
+- A saved .txt starts with the snapshot name, time zone and the filters used.
+- Rows the console saved without a time are counted in the status bar.
+- Each kind has its own tag color.
+- Tank alarms the console added later (low temperature, gain and loss warnings, ...) are named.
+- A damaged or oversized snapshot is refused with a message instead of hanging at "Loading".
+- Time boxes refuse negative times.
+
 ## 0.3.1
 
 - First release published on GitHub, including the update check from 0.3.0.

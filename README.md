@@ -1,16 +1,18 @@
 # TLS-450 Plus Snapshot Audit Log Tool
 
 A small Windows program that opens a TLS-450 Plus snapshot (`snapshot-<serial>-YYMMDD-HHMM.tar`)
-and shows its audit trail, alarm events and static leak tests in one table, in the console's
-local time.
+and shows every log in it in one table, in the console's local time: the audit trail, alarms,
+leak tests (static, CSLD and line), compliance records, deliveries, inventory, power, the
+application log, auto events and the console's program log files.
 
 ![App icon](assets/icon-256.png)
 
 ## What it does
 
 - Lists logins, logouts, setting changes and alarm acknowledgements with the user for each,
-  alarm events, and manual and automatic leak tests.
-- Pick a time range, show or hide each kind of event, filter by user or device, and search.
+  and everything else the console logged, as 17 kinds of event.
+- Pick a time range, tick the kinds of event to show (each with a count), filter by user or
+  device, and search (with "phrases" and -words to leave out).
 - Sort by any column, select rows, and save or copy them as plain text.
 - Right-click a row to see everything that happened within 15 minutes of it.
 

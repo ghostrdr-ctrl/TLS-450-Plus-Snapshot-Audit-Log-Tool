@@ -1,5 +1,5 @@
-//! Reads a TLS-450 Plus snapshot .tar into a flat list of events:
-//! audit trail entries, alarm events and static (SLD) leak test starts/ends.
+//! Reads a TLS-450 Plus snapshot .tar into a flat list of events, one `Kind`
+//! per log: the audit trail and alarms here, everything else in `history`.
 //!
 //! Where it reads from (see docs/DEVELOPMENT.md):
 //! - databases.tgz: the console's SQLite `.tls` files (times are Unix seconds, UTC).
@@ -7,6 +7,9 @@
 //!   status.log's `=== date time -0700 ===` lines are the fallback.
 //! - opt_atg_etc.tgz > TLSWebService.wsdl: the console's own names for device
 //!   types and alarm types (`<enumeration value="..."/><!-- enum const = N -->`).
+//! - opt_atg_logs.tgz: the console's program log files (`history::program_logs`).
+
+mod history;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -15,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 use flate2::read::GzDecoder;
 use rusqlite::{Connection, OpenFlags};
+
+pub use crate::kind::Kind;
 
 /// Tank alarm labels by AlarmID (DeviceType 2), as the console's screens name them.
 const TANK_ALARMS: [&str; 33] = [
@@ -92,43 +97,27 @@ const ACRONYMS: &[&str] = &[
     "FMS", "SNMP", "HTTP", "HTTPS", "FTP", "PDF", "CSV", "XML", "LED", "LCD", "UI", "AC", "DC",
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Source {
-    Audit,
-    Alarm,
-    Test,
-}
-
-impl Source {
-    pub fn label(self) -> &'static str {
-        match self {
-            Source::Audit => "AUDIT",
-            Source::Alarm => "ALARM",
-            Source::Test => "TEST",
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Row {
     pub utc: i64,
     /// Console local time, `YYYY-MM-DD HH:MM:SS`.
     pub time: String,
-    pub source: Source,
-    /// Manual leak test (only meaningful for `Source::Test`).
-    pub manual: bool,
+    pub kind: Kind,
     pub device: String,
     pub user: String,
     pub event: String,
     pub value: String,
     pub previous: String,
+    /// A Log Management entry that is also in the audit trail: hidden while
+    /// audit rows are shown, so the same action is not listed twice.
+    pub repeat: bool,
 }
 
 impl Row {
     pub fn columns(&self) -> [&str; 7] {
         [
             &self.time,
-            self.source.label(),
+            self.kind.tag(),
             &self.device,
             &self.user,
             &self.event,
@@ -136,9 +125,11 @@ impl Row {
             &self.previous,
         ]
     }
-    /// Lower-case text of every column, for search.
+    /// Lower-case text of every column, for search. Columns are joined by a
+    /// line break (which the search box can't hold), so a phrase never runs
+    /// from one column into the next.
     pub fn haystack(&self) -> String {
-        self.columns().join(" ").to_lowercase()
+        self.columns().join("\n").to_lowercase()
     }
 }
 
@@ -148,8 +139,147 @@ pub struct Loaded {
     pub rows: Vec<Row>,
     /// Parts of the snapshot that could not be read (e.g. "audit trail").
     pub missing: Vec<String>,
+    /// Tables that are in the snapshot but could not be read (an unexpected layout).
+    pub unreadable: Vec<String>,
     /// Rows that were in a table but couldn't be read (e.g. a NULL time).
     pub skipped: usize,
+    /// Rows the console saved with no time, by `Kind::index`: not shown.
+    pub no_time: [usize; Kind::COUNT],
+}
+
+/// What the readers share: the clock and the console's names for its devices.
+pub struct Ctx {
+    pub clock: Clock,
+    tanks: HashMap<i64, String>,
+    lines: HashMap<i64, String>,
+    enums: HashMap<String, BTreeMap<i64, String>>,
+    alarm_labels: HashMap<(i64, i64), String>,
+    /// Audit Interface/Method codes -> names.
+    pub names: HashMap<(i64, i64), (String, String)>,
+}
+
+impl Ctx {
+    pub fn tank(&self, id: i64) -> String {
+        match self.tanks.get(&id) {
+            Some(l) if !l.is_empty() => format!("Tank {id} {l}"),
+            _ => format!("Tank {id}"),
+        }
+    }
+
+    pub fn line(&self, id: i64) -> String {
+        match self.lines.get(&id) {
+            Some(l) if !l.is_empty() => format!("Line {id} {l}"),
+            _ => format!("Line {id}"),
+        }
+    }
+
+    /// A WSDL enumeration's name for a value (`CsldTestResult`, 1 -> `RateTestPass`).
+    pub fn enum_name(&self, ty: &str, v: i64) -> Option<&str> {
+        self.enums.get(ty).and_then(|e| e.get(&v)).map(String::as_str)
+    }
+
+    /// The WSDL device type name without `DEVTYPE` (2 -> "TANK").
+    fn wsdl_type(&self, dtype: i64) -> Option<String> {
+        self.enum_name("DeviceType", dtype)
+            .map(|s| s.trim_end_matches("DEVTYPE").to_string())
+    }
+
+    /// A device by its type and number, as the alarm list names it
+    /// ("Tank 1 REGULAR", "Liquid sensor 3 STP SUMP", "System").
+    pub fn device(&self, dtype: i64, did: i64) -> String {
+        if dtype == 2 {
+            return self.tank(did);
+        }
+        let wsdl = self.wsdl_type(dtype);
+        let known = wsdl.as_deref().and_then(|w| DEVICE_TYPES.iter().find(|d| d.0 == w));
+        let type_name = match (known, &wsdl) {
+            (Some(k), _) => k.1.to_string(),
+            (None, Some(w)) => title_case(w),
+            (None, None) => format!("Device type {dtype}"),
+        };
+        if type_name == "Line" {
+            return self.line(did);
+        }
+        let mut device = if dtype == 1 { type_name } else { format!("{type_name} {did}") };
+        if let Some(l) = self.alarm_labels.get(&(dtype, did)).filter(|l| !l.is_empty()) {
+            device = format!("{device} {l}");
+        }
+        device
+    }
+
+    /// An alarm's name from its device type and alarm number.
+    pub fn alarm_name(&self, dtype: i64, aid: i64) -> String {
+        if dtype == 2 {
+            // The console's own screen names first; newer alarms from its WSDL.
+            return usize::try_from(aid)
+                .ok()
+                .and_then(|i| TANK_ALARMS.get(i))
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    self.enums
+                        .get("InTankAlarms")
+                        .and_then(|e| e.get(&aid))
+                        .map(|s| wsdl_alarm_label(s))
+                })
+                .unwrap_or(format!("TANK ALARM {aid}"));
+        }
+        self.wsdl_type(dtype)
+            .and_then(|w| DEVICE_TYPES.iter().find(|d| d.0 == w))
+            .and_then(|k| self.enums.get(k.2))
+            .and_then(|e| e.get(&aid))
+            .map(|s| wsdl_alarm_label(s))
+            .unwrap_or(format!("ALARM {aid}"))
+    }
+
+    /// An audit (or Log Management) entry's Device and Event columns.
+    pub fn audit_event(&self, iface: i64, method: i64, id: i64) -> (String, String) {
+        let (iname, mname) = self
+            .names
+            .get(&(iface, method))
+            .cloned()
+            .unwrap_or((format!("Interface{iface}"), format!("Method{method}")));
+        let tankish = ["Tank", "SLD", "CSLD", "Probe"].iter().any(|k| iname.contains(k));
+        let device = if id <= 0 {
+            String::new()
+        } else if tankish {
+            self.tank(id)
+        } else {
+            format!("{} {id}", words(&iname).trim_end_matches(" Info"))
+        };
+        (device, format!("{}: {}", words(&iname), words(&mname)))
+    }
+}
+
+/// Rows as the readers make them; a row with a time that isn't one is
+/// counted, not shown.
+#[derive(Default)]
+pub struct Out {
+    pub rows: Vec<Row>,
+    pub skipped: usize,
+    pub unreadable: Vec<String>,
+    /// Rows the console saved with no time (0), by `Kind::index`.
+    pub no_time: [usize; Kind::COUNT],
+}
+
+/// Earliest and latest believable event times (2000 to 2100). A time of 0 is
+/// one the console never set (e.g. a Log Management entry written at power up
+/// before the clock ran): counted, not shown. Anything else outside the range
+/// is a damaged row.
+const TIME_RANGE: std::ops::RangeInclusive<i64> = 946_684_800..=4_102_444_800;
+
+impl Out {
+    /// Adds `r` with its local time filled in, if its time is believable.
+    pub fn push(&mut self, ctx: &Ctx, utc: Option<i64>, mut r: Row) {
+        match utc {
+            Some(0) => self.no_time[r.kind.index()] += 1,
+            Some(t) if TIME_RANGE.contains(&t) => {
+                r.utc = t;
+                r.time = ctx.clock.local(t);
+                self.rows.push(r);
+            }
+            _ => self.skipped += 1,
+        }
+    }
 }
 
 pub fn load(tar_path: &Path) -> Result<Loaded, String> {
@@ -162,33 +292,46 @@ pub fn load(tar_path: &Path) -> Result<Loaded, String> {
             std: off,
             dst: false,
             name: hm(off),
+            fixed: true,
         }
     } else {
         Clock {
             std: 0,
             dst: false,
             name: "UTC".into(),
+            fixed: true,
         }
     };
-    let enums = ex.wsdl.as_deref().map(parse_wsdl_enums).unwrap_or_default();
-    let mut missing = vec![];
-    let mut rows = vec![];
-
-    let tanks: HashMap<i64, String> = query(
-        &ex.db("TankSetupDB.tls"),
-        "select DeviceID, DeviceLabel from TankSetup where Configured = 1",
-        |r| Ok((r.get::<_, i64>(0)?, clean(&text(r, 1)))),
-    )
-    .unwrap_or_default()
-    .into_iter()
-    .collect();
-    let tank = |id: i64| match tanks.get(&id) {
-        Some(l) if !l.is_empty() => format!("Tank {id} {l}"),
-        _ => format!("Tank {id}"),
+    let labels = |db: &str, sql: &str| -> HashMap<i64, String> {
+        lookup(&ex.db(db), sql, |r| Ok((r.get::<_, i64>(0)?, clean(&text(r, 1)))))
+            .unwrap_or_default()
+            .into_iter()
+            .collect()
     };
+    let alarms = ex.db("AlarmDB.tls");
+    let ctx = Ctx {
+        clock,
+        tanks: labels(
+            "TankSetupDB.tls",
+            "select DeviceID, DeviceLabel from TankSetup where Configured = 1",
+        ),
+        lines: labels(
+            "LineSetupDB.tls",
+            "select DeviceID, DeviceLabel from LineSetup where Configured = 1",
+        ),
+        enums: ex.wsdl.as_deref().map(parse_wsdl_enums).unwrap_or_default(),
+        alarm_labels: lookup(&alarms, "select DeviceType, DeviceID, DeviceLabel from AlarmDevice", |r| {
+            Ok(((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?), clean(&text(r, 2))))
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .collect(),
+        names: audit_names(&ex),
+    };
+    let mut missing = vec![];
+    let mut out = Out::default();
 
     // Audit trail.
-    let names = audit_names(&ex);
     match query(
         &ex.db("AuditTrailHistoryDB.tls"),
         "select TimeStamp, Interface, Method, ID, NewValue, OldValue, User from AuditTrailHistory order by ItemID",
@@ -207,36 +350,26 @@ pub fn load(tar_path: &Path) -> Result<Loaded, String> {
         None => missing.push("audit trail".to_string()),
         Some(list) => {
             for (at, i, m, id, new, old, user) in list {
-                let (iface, method) = names
-                    .get(&(i, m))
-                    .cloned()
-                    .unwrap_or((format!("Interface{i}"), format!("Method{m}")));
-                let tankish = ["Tank", "SLD", "CSLD", "Probe"].iter().any(|k| iface.contains(k));
-                let device = if id <= 0 {
-                    String::new()
-                } else if tankish {
-                    tank(id)
-                } else {
-                    format!("{} {id}", words(&iface).trim_end_matches(" Info"))
-                };
-                rows.push(Row {
-                    utc: at,
-                    time: clock.local(at),
-                    source: Source::Audit,
-                    manual: false,
-                    device,
-                    user: clean(&user),
-                    event: format!("{}: {}", words(&iface), words(&method)),
-                    value: clean(&new),
-                    previous: clean(&old),
-                });
+                let (device, event) = ctx.audit_event(i, m, id);
+                out.push(
+                    &ctx,
+                    Some(at),
+                    Row {
+                        kind: Kind::Audit,
+                        device,
+                        user: clean(&user),
+                        event,
+                        value: clean(&new),
+                        previous: clean(&old),
+                        ..Row::default()
+                    },
+                );
             }
         }
     }
 
     // Alarms.
-    let alarms = ex.db("AlarmDB.tls");
-    let actions: HashMap<i64, String> = query(&alarms, "select ID, Name from AlarmActionList", |r| {
+    let actions: HashMap<i64, String> = lookup(&alarms, "select ID, Name from AlarmActionList", |r| {
         Ok((r.get::<_, i64>(0)?, text(r, 1)))
     })
     .unwrap_or_default()
@@ -258,13 +391,6 @@ pub fn load(tar_path: &Path) -> Result<Loaded, String> {
         (i, n)
     })
     .collect();
-    let labels: HashMap<(i64, i64), String> = query(&alarms, "select DeviceType, DeviceID, DeviceLabel from AlarmDevice", |r| {
-        Ok(((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?), clean(&text(r, 2))))
-    })
-    .unwrap_or_default()
-    .into_iter()
-    .collect();
-    let dev_types = enums.get("DeviceType");
     match query(
         &alarms,
         "select h.TimeStamp, h.EventType, d.DeviceType, d.DeviceID, d.AlarmID, d.PostValue \
@@ -283,101 +409,40 @@ pub fn load(tar_path: &Path) -> Result<Loaded, String> {
         None => missing.push("alarms".to_string()),
         Some(list) => {
             for (at, et, dtype, did, aid, val) in list {
-                let wsdl_type = dev_types
-                    .and_then(|t| t.get(&dtype))
-                    .map(|s| s.trim_end_matches("DEVTYPE").to_string());
-                let known = wsdl_type.as_deref().and_then(|w| DEVICE_TYPES.iter().find(|d| d.0 == w));
-                let (device, label) = if dtype == 2 {
-                    (
-                        tank(did),
-                        TANK_ALARMS
-                            .get(aid as usize)
-                            .map(|s| s.to_string())
-                            .unwrap_or(format!("TANK ALARM {aid}")),
-                    )
-                } else {
-                    let type_name = match (known, &wsdl_type) {
-                        (Some(k), _) => k.1.to_string(),
-                        (None, Some(w)) => title_case(w),
-                        (None, None) => format!("Device type {dtype}"),
-                    };
-                    let mut device = if dtype == 1 { type_name } else { format!("{type_name} {did}") };
-                    if let Some(l) = labels.get(&(dtype, did)).filter(|l| !l.is_empty()) {
-                        device = format!("{device} {l}");
-                    }
-                    let label = known
-                        .and_then(|k| enums.get(k.2))
-                        .and_then(|e| e.get(&aid))
-                        .map(|s| wsdl_alarm_label(s))
-                        .unwrap_or(format!("ALARM {aid}"));
-                    (device, label)
-                };
                 let action = actions.get(&et).cloned().unwrap_or(format!("event {et}"));
-                rows.push(Row {
-                    utc: at,
-                    time: clock.local(at),
-                    source: Source::Alarm,
-                    manual: false,
-                    device,
-                    user: String::new(),
-                    event: format!("{label} {action}"),
-                    value: val.map(|v| format!("{v:.1}")).unwrap_or_default(),
-                    previous: String::new(),
-                });
+                out.push(
+                    &ctx,
+                    Some(at),
+                    Row {
+                        kind: Kind::Alarm,
+                        device: ctx.device(dtype, did),
+                        event: format!("{} {action}", ctx.alarm_name(dtype, aid)),
+                        value: val.map(|v| format!("{v:.1}")).unwrap_or_default(),
+                        ..Row::default()
+                    },
+                );
             }
         }
     }
 
     // Static (SLD) leak tests: one row at the start, one at the end.
-    match query(
-        &ex.db("SLDStatusDB.tls"),
-        "select AnalyzerID, StartTime, EndTime, DurationInMinutes, StartMethod, StartVolume from SLDHistory",
-        |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, i64>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, f64>(5).unwrap_or(0.0),
-            ))
-        },
-    ) {
-        None => missing.push("leak tests".to_string()),
-        Some(list) => {
-            for (tid, start, end, mins, method, vol) in list {
-                let kind = match method {
-                    1 => "Manual".to_string(),
-                    5 => "Automatic".to_string(),
-                    n => format!("Method {n}"),
-                };
-                for (at, what, value) in [
-                    (start, "started", format!("start volume {vol:.0} gal")),
-                    (end, "ended", format!("duration {mins} min")),
-                ] {
-                    rows.push(Row {
-                        utc: at,
-                        time: clock.local(at),
-                        source: Source::Test,
-                        manual: method == 1,
-                        device: tank(tid),
-                        user: String::new(),
-                        event: format!("{kind} static leak test {what}"),
-                        value,
-                        previous: String::new(),
-                    });
-                }
-            }
-        }
+    if !history::static_tests(&ex, &ctx, &mut out) {
+        missing.push("static leak tests".to_string());
     }
 
+    // Everything else the console keeps; a site without a feature has no rows.
+    history::read_all(&ex, &ctx, &mut out);
+
+    let mut rows = out.rows;
     rows.sort_by_key(|r| r.utc);
     Ok(Loaded {
         path: tar_path.to_path_buf(),
-        clock,
+        clock: ctx.clock,
         rows,
         missing,
-        skipped: SKIPPED.with(|s| s.get()),
+        unreadable: out.unreadable,
+        skipped: out.skipped + SKIPPED.with(|s| s.get()),
+        no_time: out.no_time,
     })
 }
 
@@ -388,7 +453,21 @@ struct Extracted {
     status_log: Option<String>,
     timezone: Option<String>,
     wsdl: Option<String>,
+    /// Program log files (opt/atg/logs, not status.log): (file name, text),
+    /// rotated `.gz` copies unpacked.
+    logs: Vec<(String, String)>,
 }
+
+/// A program log file bigger than this (unpacked) is not read: the table
+/// would hold more noise than anyone can read. All of them together are
+/// capped too.
+const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_LOGS_TOTAL: u64 = 256 * 1024 * 1024;
+/// One console database, and all of them, unpacked (real ones are a few MB).
+const MAX_DB_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_DB_TOTAL: u64 = 2 * 1024 * 1024 * 1024;
+/// status.log and the WSDL.
+const MAX_TEXT_BYTES: u64 = 64 * 1024 * 1024;
 
 impl Drop for Extracted {
     fn drop(&mut self) {
@@ -409,11 +488,13 @@ impl Extracted {
             status_log: None,
             timezone: None,
             wsdl: None,
+            logs: vec![],
         };
 
         let f = fs::File::open(tar_path).map_err(|e| format!("Can't open {}: {e}", tar_path.display()))?;
         let mut outer = tar::Archive::new(f);
         let mut found_db = false;
+        let (mut db_bytes, mut log_bytes) = (0u64, 0u64);
         let entries = outer.entries().map_err(|_| "This file is not a snapshot .tar.".to_string())?;
         for entry in entries {
             let mut entry = entry.map_err(|_| "This file is not a snapshot .tar (or it is damaged).".to_string())?;
@@ -430,16 +511,51 @@ impl Extracted {
                 let n = base_name(&full);
                 let rel = full.trim_start_matches("./").trim_start_matches('/');
                 if name == "databases.tgz" && n.ends_with(".tls") {
-                    let mut buf = vec![];
-                    e.read_to_end(&mut buf).map_err(|e| e.to_string())?;
-                    fs::write(ex.dir.join(&n), buf).map_err(|e| e.to_string())?;
+                    // Only a plain file name is written, and only inside our own
+                    // folder: no drive ("C:x.tls"), no path, no odd characters.
+                    if !safe_db_name(&n) || !e.header().entry_type().is_file() {
+                        continue;
+                    }
+                    let path = ex.dir.join(&n);
+                    if path.parent() != Some(ex.dir.as_path()) {
+                        continue;
+                    }
+                    // Streamed to disk with a cap, so a small archive can't unpack
+                    // into gigabytes.
+                    let room = MAX_DB_TOTAL.saturating_sub(db_bytes).min(MAX_DB_BYTES);
+                    let mut out = fs::File::create(&path).map_err(|e| e.to_string())?;
+                    let n_bytes = std::io::copy(&mut (&mut e).take(room + 1), &mut out).map_err(|e| e.to_string())?;
+                    drop(out);
+                    if n_bytes > room {
+                        let _ = fs::remove_file(&path);
+                        return Err(format!(
+                            "{n} in this snapshot is too large to open (over {} MB).",
+                            room / (1024 * 1024)
+                        ));
+                    }
+                    db_bytes += n_bytes;
                     found_db = true;
                 } else if name == "opt_atg_logs.tgz" && n == "status.log" {
-                    ex.status_log = read_text(&mut e);
+                    ex.status_log = read_capped(&mut e, MAX_TEXT_BYTES);
+                } else if name == "opt_atg_logs.tgz"
+                    && e.header().entry_type().is_file()
+                    && !n.starts_with("status.log")
+                    && rel.contains("logs/")
+                {
+                    let room = MAX_LOGS_TOTAL.saturating_sub(log_bytes).min(MAX_LOG_BYTES);
+                    let text = if n.ends_with(".gz") {
+                        read_capped(&mut GzDecoder::new(&mut e), room)
+                    } else {
+                        read_capped(&mut e, room)
+                    };
+                    if let Some(t) = text {
+                        log_bytes += t.len() as u64;
+                        ex.logs.push((n.clone(), t));
+                    }
                 } else if name == "etc.tgz" && rel == "etc/timezone" {
-                    ex.timezone = read_text(&mut e);
+                    ex.timezone = read_capped(&mut e, 4096);
                 } else if name == "opt_atg_etc.tgz" && n == "TLSWebService.wsdl" {
-                    ex.wsdl = read_text(&mut e);
+                    ex.wsdl = read_capped(&mut e, MAX_TEXT_BYTES);
                 }
             }
         }
@@ -457,10 +573,20 @@ impl Extracted {
     }
 }
 
-fn read_text(e: &mut impl Read) -> Option<String> {
+/// A text file of at most `cap` bytes; None if it is bigger or can't be read.
+fn read_capped(e: &mut impl Read, cap: u64) -> Option<String> {
     let mut buf = vec![];
-    e.read_to_end(&mut buf).ok()?;
+    e.take(cap + 1).read_to_end(&mut buf).ok()?;
+    if buf.len() as u64 > cap {
+        return None;
+    }
     Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// A database file name as the console writes them ("AlarmDB.tls"): letters,
+/// digits, `_`, `-` and `.` only, so it can only name a file in our folder.
+fn safe_db_name(n: &str) -> bool {
+    n.len() <= 100 && !n.starts_with('.') && n.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
 fn base_name(p: &str) -> String {
@@ -481,6 +607,15 @@ fn query<T>(c: &Option<Connection>, sql: &str, f: impl Fn(&rusqlite::Row) -> rus
         }
     }
     Some(out)
+}
+
+/// `query` for names and labels: rows it can't read are not event rows, so
+/// they don't count as skipped.
+fn lookup<T>(c: &Option<Connection>, sql: &str, f: impl Fn(&rusqlite::Row) -> rusqlite::Result<T>) -> Option<Vec<T>> {
+    let before = SKIPPED.with(|s| s.get());
+    let out = query(c, sql, f);
+    SKIPPED.with(|s| s.set(before));
+    out
 }
 
 fn text(r: &rusqlite::Row, i: usize) -> String {
@@ -602,7 +737,7 @@ fn audit_names(ex: &Extracted) -> HashMap<(i64, i64), (String, String)> {
         .collect();
     files.sort_by_key(|n| n != "ValidationDB.tls");
     for f in files {
-        for (fi, si, iface, method) in query(
+        for (fi, si, iface, method) in lookup(
             &ex.db(&f),
             "select s.FeatureID, s.SettingID, f.TlsInterfaces, s.SettingName from SettingList s \
              join FeatureList f on f.FeatureID = s.FeatureID",
@@ -655,6 +790,9 @@ pub struct Clock {
     /// US daylight saving (2nd Sunday of March to 1st Sunday of November, 02:00).
     pub dst: bool,
     pub name: String,
+    /// The zone isn't one this program knows: a fixed offset (from status.log,
+    /// or UTC), without daylight saving.
+    pub fixed: bool,
 }
 
 pub fn hm(secs: i64) -> String {
@@ -738,6 +876,7 @@ pub fn clock_from_timezone(s: &str) -> Option<Clock> {
         std: std_h * 3600,
         dst,
         name,
+        fixed: false,
     })
 }
 
@@ -746,11 +885,12 @@ pub fn offset_from_status(s: &str) -> Option<i64> {
     s.lines().rev().find_map(|l| {
         let l = l.trim().strip_prefix("===")?.strip_suffix("===")?.trim();
         let z = l.split_whitespace().nth(2)?;
-        if z.len() != 5 || !(z.starts_with('+') || z.starts_with('-')) {
+        let b = z.as_bytes();
+        if b.len() != 5 || !(b[0] == b'+' || b[0] == b'-') || !b[1..].iter().all(u8::is_ascii_digit) {
             return None;
         }
-        let h: i64 = z[1..3].parse().ok()?;
-        let m: i64 = z[3..5].parse().ok()?;
+        let h: i64 = z.get(1..3)?.parse().ok()?;
+        let m: i64 = z.get(3..5)?.parse().ok()?;
         let v = h * 3600 + m * 60;
         Some(if z.starts_with('-') { -v } else { v })
     })
@@ -778,7 +918,7 @@ pub fn parse_local(s: &str, end: bool) -> Option<i64> {
     let h = *t.first().unwrap_or(&def[0]);
     let mi = *t.get(1).unwrap_or(&def[1]);
     let se = *t.get(2).unwrap_or(if t.len() == 2 && end { &59 } else { &def[2] });
-    if h > 23 || mi > 59 || se > 59 {
+    if !(0..=23).contains(&h) || !(0..=59).contains(&mi) || !(0..=59).contains(&se) {
         return None;
     }
     Some(days_from_civil(d[0], d[1], d[2]) * 86400 + h * 3600 + mi * 60 + se)
@@ -787,6 +927,20 @@ pub fn parse_local(s: &str, end: bool) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostile_input_is_refused_not_panicked_on() {
+        assert_eq!(offset_from_status("=== 2026-11-05 15:30:03 +0\u{e9}0 ==="), None);
+        assert_eq!(offset_from_status("=== 2026-11-05 15:30:03 +0130 ==="), Some(5400));
+        assert_eq!(parse_local("2026-11-04 -3:00", false), None);
+        assert_eq!(parse_local("2026-11-04 03:-1", false), None);
+        assert!(safe_db_name("AlarmDB.tls"));
+        for bad in ["C:evil.tls", "x:.tls", "..tls", "a b.tls", "a\\b.tls", "con<.tls"] {
+            assert!(!safe_db_name(bad), "{bad}");
+        }
+        assert_eq!(read_capped(&mut &b"12345"[..], 5).as_deref(), Some("12345"));
+        assert_eq!(read_capped(&mut &b"123456"[..], 5), None);
+    }
 
     #[test]
     fn mountain_time_with_daylight_saving() {
@@ -876,9 +1030,20 @@ mod tests {
         let p = std::env::var("TLS450_SNAPSHOT").expect("set TLS450_SNAPSHOT");
         let d = load(Path::new(&p)).unwrap();
         assert!(!d.rows.is_empty());
-        for r in d.rows.iter().filter(|r| r.source == Source::Alarm).take(8) {
-            println!("{}", r.columns().join(" | "));
+        for k in Kind::ALL {
+            let of: Vec<&Row> = d.rows.iter().filter(|r| r.kind == k).collect();
+            println!("== {} ({}, {} with no time)", k.name(), of.len(), d.no_time[k.index()]);
+            for r in of.iter().rev().take(3) {
+                println!("{}{}", r.columns().join(" | "), if r.repeat { "  [repeat]" } else { "" });
+            }
         }
-        println!("{} rows, zone {}, missing {:?}", d.rows.len(), d.clock.zone(), d.missing);
+        println!(
+            "{} rows, zone {}, missing {:?}, unreadable {:?}, skipped {}",
+            d.rows.len(),
+            d.clock.zone(),
+            d.missing,
+            d.unreadable,
+            d.skipped
+        );
     }
 }

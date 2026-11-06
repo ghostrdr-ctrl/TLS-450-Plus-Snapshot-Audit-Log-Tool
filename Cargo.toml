@@ -1,6 +1,6 @@
 [package]
 name = "tls450-plus-snapshot-audit-log-tool"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 description = "Open a TLS-450 Plus snapshot .tar, filter and search its audit trail, alarms and leak tests, save to .txt"

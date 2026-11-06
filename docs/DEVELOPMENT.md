@@ -1,14 +1,16 @@
 # Development notes
 
 A Windows program (Rust, egui) that opens a TLS-450 Plus snapshot
-(`snapshot-<serial>-YYMMDD-HHMM.tar`) and lists its events in one table:
+(`snapshot-<serial>-YYMMDD-HHMM.tar`) and lists every log in it in one table, as
+17 kinds of event (`src/kind.rs`): the audit trail and log management (with the
+user for each), alarm events and the alarm period report, static leak tests
+(manual and automatic), CSLD, line leak tests and their diagnostics, compliance
+records, deliveries, inventory and shifts, power off and on, the application
+log, auto events, the program log files and ISD records.
 
-- the audit trail (logins, logouts, alarm acknowledgements, setting changes, and the user for each)
-- alarm events (posted, acknowledged, cleared, ...)
-- static (SLD) leak test starts and ends, manual and automatic
-
-You choose the time range, filter, search, and save what is shown to a `.txt` file.
-The saved file is just the rows, with a header line of column names.
+You choose the time range and kinds, filter, search, and save what is shown to
+a `.txt` file. The saved file starts with the snapshot name, the time zone and
+the filters, then a header line of column names and the rows.
 
 ## Use
 
@@ -18,22 +20,36 @@ The saved file is just the rows, with a header line of column names.
   `YYYY-MM-DD HH:MM:SS`. An invalid time, or From after To, is outlined in red and
   shows no rows (so nothing unintended gets saved). **All**, **Last 24 h** and
   **Last 7 days** count back from the newest event in the snapshot.
-- **Show**: Audit trail, Alarms, Manual leak tests, Automatic leak tests (off by
-  default; there are a lot of them).
+- **Show** (the left panel): a tick box per kind, in groups, with how many rows of
+  it match the time range, User, Device and Search ("none": the snapshot has
+  none). Defaults ticks the audit trail, alarm events, manual static tests, line
+  leak tests, deliveries and power; the bulk records are off. All / None, an
+  all/none link per group, right-click or Alt+click a kind to show only it.
+  Hide folds the panel (it also folds itself below 1000 px); the Filter row then
+  has a Show button. Ticks carry over to the next snapshot opened. Log
+  management entries that repeat an audit row are hidden while Audit trail is
+  ticked.
 - **Sort**: click a column header to sort by it, again to reverse (an arrow shows
   which). Default is Time, newest first. Rows with that cell blank go last;
   numbers inside text sort as numbers (Tank 2 before Tank 10).
-- **Filter**: User and Device drop-downs (they list what the ticked event types
-  contain), and **Search** (Ctrl+F): any words, case doesn't matter, every word must
-  appear somewhere in the row. Esc in the box clears it.
+- **Filter**: User and Device drop-downs (they list what the ticked kinds contain;
+  type to narrow, Enter picks the first match; a choice whose kinds get unticked
+  stays chosen and is marked), and **Search** (Ctrl+F): words, case doesn't
+  matter, every word must appear somewhere in the row; `"a phrase"` must appear
+  as typed within one column; `-word` or `-"a phrase"` leaves rows out. Esc in
+  the box clears it.
+- The status bar shows how many more rows match in kinds not ticked, and one
+  Notices item for anything about how the snapshot was read (tables missing or
+  not readable, rows with no time). An empty table says why and offers the fix.
 - **Rows**: click to select, Ctrl+click to add, Shift+click for a range, Ctrl+A for
   all shown, Esc to clear. Right-click a row for **Show all events within 15 min**
-  (every event type, any user or device, the row stays selected), **Copy row** and
+  (every kind, any user or device, the row stays selected; **Back to previous
+  filters** in the toolbar undoes it), **Copy row** and
   **Copy row with header** (tab-separated).
 - **Save ... to .txt...** (Ctrl+S) and **Copy** use the selected rows if any are
   selected, otherwise every row shown; the buttons say which and how many. The
-  file is a header line plus the rows, nothing else.
-- Leak tests appear when they end; the console doesn't record who starts them.
+  file starts with the snapshot, time zone and filters; Copy is the rows only.
+- The console doesn't record who starts a leak test.
 
 ## Version
 
@@ -95,5 +111,29 @@ A snapshot `.tar` holds more `.tgz` files; the program reads:
 | `AuditTrailHistoryDB` → `AuditTrailHistory` | Audit rows: `TimeStamp`, `Interface`, `Method`, `ID` (device number), `NewValue`, `OldValue`, `User`. |
 | `ValidationDB` (and the other `*ValidationDB`) → `FeatureList` + `SettingList` | Names for the audit codes: `Interface` = `FeatureID`, `Method` = `SettingID` (e.g. 1/0 = Tls Security: Login, 12/5 = CSLD Info: Set Csld Climate Factor). |
 | `AlarmDB` → `AlarmHistory` + `AlarmHistoryDetail` + `AlarmActionList` | Alarm rows. `AlarmHistory.EventID` = `AlarmHistoryDetail.ItemID`. Tank alarms (`DeviceType` 2) are named from the console's alarm list (1 = LEAK ALARM, ...). The New column holds `PostValue`. |
-| `SLDStatusDB` → `SLDHistory` | Leak test rows (finished tests only; a test is saved when it ends). `StartMethod` 1 = manual, 5 = automatic. |
-| `TankSetupDB` → `TankSetup` | Tank labels. |
+| `SLDStatusDB` → `SLDHistory` | Static leak tests, a row at the start and one at the end (finished tests only; a test is saved when it ends). `StartMethod` 1 = manual, 5 = automatic. `TestType` 0/1/2 = 0.2 gph / 0.1 gph / gross; `LeakTestResult_1/_2/_3` hold that test's result (WSDL `LeakTestResult`). |
+| `TankSetupDB` → `TankSetup`, `LineSetupDB` → `LineSetup` | Tank and line labels (a PLLD `AnalyzerID` is its line number). |
+
+The other kinds are read by `src/snapshot/history.rs`, one function per table, with `select *` and
+columns looked up by name (a table that is absent gives no rows; one missing a needed column is
+reported in the status bar Notices). Codes are named from the WSDL enumerations noted in the code.
+
+| Kind | Tables |
+|---|---|
+| Log management | `LogManagementHistoryDB.LogManagementHistory` (audit layout; exact repeats of an audit row are flagged) |
+| Alarm period report | `AlarmDB.AlarmPeriodNormalHistory` |
+| CSLD | `CSLDStatusDB`: `CSLDRateRecordHistory` (at each test's end), `CSLDStateChangesHistory`, `CSLDPosRejectStatusChangesHistory`, `CSLDTestStatus` |
+| Line leak tests | `PLLDInternalsHistoriesDB.UserResultHistory` |
+| Line leak diagnostics | `PLLDInternalsHistoriesDB`: `ResultHistory`, `PrecisionDiagHistory`, `PortDiagnosticHistory`, `NoSpikeDiagnosticHistory`, `AutoConfirmHistory` |
+| Compliance records | `ComplianceHistoryDB`: `MonthlyComplianceHistory`, `LastPassedComplianceHistory`, `TidelLeakResult`; `PLLDInternalsRecordsDB.LastPassedTest` |
+| Deliveries | `DeliveryDB`: `StdDeliveryHist`, `PowerOutageDeliveryHistory`, `TidelDeliveryClose` |
+| Inventory and shifts | `InventoryHistory` and `ShiftInvHistory` in `DeliveryHistoryDB` and `InventoryHistoryDB`; `PowerOutageHistory`, `GeneratorInventoryReport` |
+| Power off and on | `ApplicationLogDB.PowerResetHistory` |
+| Application log | `ApplicationLogDB.ApplicationLogHistory` |
+| Auto events | `AutoEventsDB.AutoEventsLog` |
+| ISD records | `ISDQListDB.ISD_pvcrack_history` |
+| Program log files | `opt_atg_logs.tgz`: every file under `logs/` except `status.log`, rotated `.gz` copies unpacked. Dated lines are rows (console local time as written); undated lines continue the row above. |
+
+Not read: `ManifoldedDeliveryHist` and `PLLDTestHistory` (repeat other tables), `CSLDVolumeHistory`,
+`HourlyPassed_3_0_Tests` and `ProfileTestResult` (counters with no event time). A time of 0 means
+the console never set it; those rows are counted in Notices, not listed.

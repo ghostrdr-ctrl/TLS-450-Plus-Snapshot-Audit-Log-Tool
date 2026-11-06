@@ -2424,7 +2424,7 @@ dependencies = [
 
 [[package]]
 name = "tls450-plus-snapshot-audit-log-tool"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "egui_extras",

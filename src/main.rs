@@ -1,9 +1,11 @@
 //! TLS-450 Plus Snapshot Audit Log Tool: open a TLS-450 Plus snapshot .tar,
-//! pick a time range, filter and search its audit trail, alarm and leak test
-//! events, and save or copy what is shown (or selected) as plain text.
+//! pick a time range and the kinds of event to show (audit trail, alarms, leak
+//! tests, deliveries, the console's logs, ...), filter and search them, and
+//! save or copy what is shown (or selected) as plain text.
 
 #![windows_subsystem = "windows"]
 
+mod kind;
 #[cfg(feature = "review-shots")]
 mod shots;
 mod snapshot;
@@ -13,11 +15,12 @@ use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
 use eframe::egui::{self, Align, Color32, Key, Label, Layout, Modifiers, RichText, TextEdit};
 use egui_extras::{Column, TableBuilder};
-use snapshot::{Loaded, Row, Source, parse_local};
+use kind::{GROUPS, KindSet};
+use snapshot::{Kind, Loaded, Row, parse_local};
 
 const APP_NAME: &str = "TLS-450 Plus Snapshot Audit Log Tool";
 /// The one version number: Cargo.toml. build.rs stamps the same value into the
@@ -29,8 +32,10 @@ const AMBER: Color32 = Color32::from_rgb(235, 175, 70);
 const BLUE: Color32 = Color32::from_rgb(110, 170, 240);
 const GREEN: Color32 = Color32::from_rgb(110, 200, 120);
 
-/// Width of the toolbar row labels (Time / Show / Filter), so the rows line up.
+/// Width of the toolbar row labels (Time / Filter), so the rows line up.
 const ROW_LABEL_W: f32 = 46.0;
+/// Below this window width the Show panel folds away on its own.
+const NARROW: f32 = 1000.0;
 /// "Show everything around this time": this many seconds either side.
 const AROUND_SECS: i64 = 15 * 60;
 
@@ -81,10 +86,8 @@ struct Filters {
     from: String,
     to: String,
     preset: Preset,
-    audit: bool,
-    alarms: bool,
-    manual_tests: bool,
-    auto_tests: bool,
+    /// The kinds of event ticked under Show, by `Kind::index`.
+    kinds: KindSet,
     user: String,
     device: String,
     search: String,
@@ -113,10 +116,7 @@ impl Default for Filters {
             from: String::new(),
             to: String::new(),
             preset: Preset::All,
-            audit: true,
-            alarms: true,
-            manual_tests: true,
-            auto_tests: false,
+            kinds: kind::defaults(),
             user: String::new(),
             device: String::new(),
             search: String::new(),
@@ -137,6 +137,13 @@ fn error(short: impl Into<String>) -> Message {
     Message::Error(s.clone(), s)
 }
 
+/// The empty table's buttons.
+enum EmptyAction {
+    Defaults,
+    All,
+    Matching,
+}
+
 /// What a time box is showing, for its outline.
 #[derive(PartialEq)]
 enum BoxState {
@@ -151,6 +158,24 @@ struct App {
     /// User and Device choices for the rows the tick boxes allow.
     users: Vec<String>,
     devices: Vec<String>,
+    /// Text typed in the User and Device lists to narrow them.
+    user_find: String,
+    device_find: String,
+    /// Rows of each kind in the snapshot, and of those, the ones the time
+    /// range, User, Device and Search let through (by `Kind::index`).
+    totals: [usize; Kind::COUNT],
+    counts: [usize; Kind::COUNT],
+    /// Log Management rows that repeat an audit row (hidden while audit is shown).
+    repeats: usize,
+    /// The Show panel is open (it can be folded away on a narrow window).
+    show_panel: bool,
+    /// The panel was folded because the window got narrow (it opens again
+    /// when the window is wide, unless the user changed it meanwhile).
+    auto_folded: bool,
+    /// Window width last frame, to notice it crossing `NARROW`.
+    last_width: Option<f32>,
+    /// The filters before "Show all events within 15 min", for "Back".
+    before_around: Option<Box<Filters>>,
     filters: Filters,
     /// Indexes (into `data.rows`) of the rows that pass the filters, in display order.
     shown: Vec<usize>,
@@ -211,6 +236,15 @@ impl App {
             hay: vec![],
             users: vec![],
             devices: vec![],
+            user_find: String::new(),
+            device_find: String::new(),
+            totals: [0; Kind::COUNT],
+            counts: [0; Kind::COUNT],
+            repeats: 0,
+            show_panel: true,
+            auto_folded: false,
+            last_width: None,
+            before_around: None,
             filters: Filters::default(),
             shown: vec![],
             shown_for: None,
@@ -301,7 +335,11 @@ impl App {
         match &mut self.update {
             UpdateState::Checking { manual, rx } => {
                 let manual = *manual;
-                let Ok(r) = rx.try_recv() else { return };
+                let r = match rx.try_recv() {
+                    Ok(r) => r,
+                    Err(TryRecvError::Empty) => return,
+                    Err(TryRecvError::Disconnected) => Err("the check stopped unexpectedly".to_string()),
+                };
                 self.update = UpdateState::Idle;
                 match r {
                     Ok(update::Check::Available(rel)) => self.update = UpdateState::Available(rel),
@@ -316,10 +354,15 @@ impl App {
                 release, rx, done, total, ..
             } => {
                 let mut finished = None;
-                while let Ok(m) = rx.try_recv() {
-                    match m {
-                        Download::Progress(d, t) => (*done, *total) = (d, t),
-                        Download::Done(r) => finished = Some(r),
+                loop {
+                    match rx.try_recv() {
+                        Ok(Download::Progress(d, t)) => (*done, *total) = (d, t),
+                        Ok(Download::Done(r)) => finished = Some(r),
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => {
+                            finished.get_or_insert(Err("the download stopped unexpectedly".to_string()));
+                            break;
+                        }
                     }
                 }
                 let Some(r) = finished else { return };
@@ -459,18 +502,46 @@ impl App {
     /// Takes a finished load, if there is one.
     fn poll_loading(&mut self) {
         let Some((path, rx)) = &self.loading else { return };
-        let Ok(result) = rx.try_recv() else { return };
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            // The loader stopped without an answer (it hit a bug): say so
+            // rather than showing "Loading..." for ever.
+            Err(TryRecvError::Disconnected) => Err("reading it stopped unexpectedly.".to_string()),
+        };
         let path = path.clone();
         self.loading = None;
         match result {
             Ok(d) => {
                 self.hay = d.rows.iter().map(Row::haystack).collect();
-                self.filters = Filters::default();
+                self.totals = [0; Kind::COUNT];
+                for r in &d.rows {
+                    self.totals[r.kind.index()] += 1;
+                }
+                self.repeats = d.rows.iter().filter(|r| r.repeat).count();
+                // The kinds ticked carry over to the next snapshot (the ones from
+                // before "Show all events within 15 min", if that is on); the rest
+                // starts afresh.
+                let kinds = match self.before_around.take() {
+                    Some(f) => f.kinds,
+                    None => self.filters.kinds,
+                };
+                self.filters = Filters {
+                    kinds,
+                    ..Filters::default()
+                };
                 if let (Some(first), Some(last)) = (d.rows.first(), d.rows.last()) {
                     self.filters.from = first.time.clone();
                     self.filters.to = last.time.clone();
                 }
-                self.message = Message::None;
+                self.message = if kinds == kind::defaults() {
+                    Message::None
+                } else {
+                    let on = kinds.iter().filter(|k| **k).count();
+                    Message::Good(format!(
+                        "Showing the {on} kinds of event ticked before. Defaults in the Show panel puts them back."
+                    ))
+                };
                 self.selected.clear();
                 self.anchor = None;
                 self.data = Some(d);
@@ -498,12 +569,7 @@ impl App {
             return;
         };
         let f = &self.filters;
-        let source_on = |r: &Row| match r.source {
-            Source::Audit => f.audit,
-            Source::Alarm => f.alarms,
-            Source::Test if r.manual => f.manual_tests,
-            Source::Test => f.auto_tests,
-        };
+        let source_on = |r: &Row| kind_shown(&f.kinds, r);
 
         // User and Device lists follow the tick boxes.
         let mut users: Vec<String> = d
@@ -513,8 +579,10 @@ impl App {
             .map(|r| r.user.clone())
             .filter(|u| !u.is_empty())
             .collect();
-        users.sort();
+        users.sort_unstable();
         users.dedup();
+        // A choice the ticks no longer cover stays chosen (the list marks it),
+        // rather than being dropped without a word.
         let mut devices: Vec<String> = d
             .rows
             .iter()
@@ -522,8 +590,10 @@ impl App {
             .map(|r| r.device.clone())
             .filter(|u| !u.is_empty())
             .collect();
-        devices.sort_by_key(|s| natural_key(s));
+        // Dedup first (cheap), then the natural sort on the few names left.
+        devices.sort_unstable();
         devices.dedup();
+        devices.sort_by_cached_key(|s| natural_key(s));
 
         // The time range: a box that isn't valid stops the range being applied,
         // and then nothing is shown (so nothing unintended gets saved).
@@ -547,36 +617,34 @@ impl App {
         };
         let after = range_error.as_deref() == Some("From is after To");
 
-        let words: Vec<String> = f.search.to_lowercase().split_whitespace().map(str::to_string).collect();
-        let mut shown: Vec<usize> = if range_error.is_some() {
-            vec![]
-        } else {
-            d.rows
-                .iter()
-                .enumerate()
-                .filter(|(i, r)| {
-                    source_on(r)
-                        && from.is_none_or(|t| r.utc >= t)
-                        && to.is_none_or(|t| r.utc <= t)
-                        && (f.user.is_empty() || r.user == f.user)
-                        && (f.device.is_empty() || r.device == f.device)
-                        && words.iter().all(|w| self.hay[*i].contains(w.as_str()))
-                })
-                .map(|(i, _)| i)
-                .collect()
+        let search = Search::parse(&f.search);
+        // Every filter but the kinds: what each kind's count in the Show panel counts.
+        let others = |i: usize, r: &Row| {
+            from.is_none_or(|t| r.utc >= t)
+                && to.is_none_or(|t| r.utc <= t)
+                && (f.user.is_empty() || r.user == f.user)
+                && (f.device.is_empty() || r.device == f.device)
+                && search.matches(&self.hay[i])
         };
+        let mut counts = [0; Kind::COUNT];
+        let mut shown: Vec<usize> = vec![];
+        if range_error.is_none() {
+            let audit_on = f.kinds[Kind::Audit.index()];
+            for (i, r) in d.rows.iter().enumerate() {
+                if (r.repeat && audit_on) || !others(i, r) {
+                    continue;
+                }
+                counts[r.kind.index()] += 1;
+                if f.kinds[r.kind.index()] {
+                    shown.push(i);
+                }
+            }
+        }
         sort_rows(&mut shown, &d.rows, f.sort);
 
-        // A User or Device that the tick boxes have hidden is dropped.
-        let mut f2 = f.clone();
-        if !f2.user.is_empty() && !users.contains(&f2.user) {
-            f2.user.clear();
-        }
-        if !f2.device.is_empty() && !devices.contains(&f2.device) {
-            f2.device.clear();
-        }
         self.users = users;
         self.devices = devices;
+        self.counts = counts;
         self.range_error = range_error;
         self.from_bad = from_bad || after;
         self.to_bad = to_bad || after;
@@ -588,12 +656,60 @@ impl App {
         }
         self.anchor = None;
         self.shown = shown;
-        if f2 != self.filters {
-            self.filters = f2;
-            self.shown_for = None;
-            self.refilter();
+        self.shown_for = Some(self.filters.clone());
+    }
+
+    /// Rows that match every filter but sit in kinds not ticked.
+    fn hidden_matches(&self) -> usize {
+        Kind::ALL
+            .iter()
+            .filter(|k| !self.filters.kinds[k.index()])
+            .map(|k| self.counts[k.index()])
+            .sum()
+    }
+
+    /// Ticks every kind that has rows matching the other filters.
+    fn tick_matching_kinds(&mut self) {
+        for k in Kind::ALL {
+            if self.counts[k.index()] > 0 {
+                self.filters.kinds[k.index()] = true;
+            }
+        }
+    }
+
+    /// The filters as lines, for the top of a saved file and the status bar tip.
+    fn filter_lines(&self) -> Vec<String> {
+        let f = &self.filters;
+        let mut v = vec![];
+        let kinds: Vec<&str> = Kind::ALL.iter().filter(|k| f.kinds[k.index()]).map(|k| k.name()).collect();
+        v.push(if kinds.len() == Kind::COUNT {
+            "Kinds: all".to_string()
         } else {
-            self.shown_for = Some(self.filters.clone());
+            format!("Kinds: {}", kinds.join(", "))
+        });
+        v.push(format!(
+            "From: {}  To: {}",
+            if f.from.trim().is_empty() { "start" } else { f.from.trim() },
+            if f.to.trim().is_empty() { "end" } else { f.to.trim() }
+        ));
+        if !f.user.is_empty() {
+            v.push(format!("User: {}", f.user));
+        }
+        if !f.device.is_empty() {
+            v.push(format!("Device: {}", f.device));
+        }
+        if !f.search.trim().is_empty() {
+            v.push(format!("Search: {}", f.search.trim()));
+        }
+        v
+    }
+
+    /// Back to the filters from before "Show all events within 15 min".
+    fn back_from_around(&mut self) {
+        if let Some(f) = self.before_around.take() {
+            self.filters = *f;
+            self.refilter();
+            self.scroll_to = self.selected.iter().next().copied();
         }
     }
 
@@ -613,6 +729,7 @@ impl App {
     }
 
     fn reset_filters(&mut self) {
+        self.before_around = None;
         self.filters = Filters {
             sort: self.filters.sort,
             ..Filters::default()
@@ -625,13 +742,13 @@ impl App {
     fn show_around(&mut self, row: usize) {
         let Some(d) = &self.data else { return };
         let utc = d.rows[row].utc;
+        if self.before_around.is_none() {
+            self.before_around = Some(Box::new(self.filters.clone()));
+        }
         self.filters.from = d.clock.local(utc - AROUND_SECS);
         self.filters.to = d.clock.local(utc + AROUND_SECS);
         self.filters.preset = Preset::Custom;
-        self.filters.audit = true;
-        self.filters.alarms = true;
-        self.filters.manual_tests = true;
-        self.filters.auto_tests = true;
+        self.filters.kinds = [true; Kind::COUNT];
         self.filters.user.clear();
         self.filters.device.clear();
         self.filters.search.clear();
@@ -700,6 +817,8 @@ impl App {
     fn nothing_reason(&self) -> Option<String> {
         if self.data.is_none() {
             Some("Nothing to save: no snapshot is open".into())
+        } else if !self.filters.kinds.contains(&true) {
+            Some("Nothing to save: no kind of event is ticked under Show".into())
         } else if let Some(e) = &self.range_error {
             Some(format!("Nothing to save: {e}"))
         } else if self.shown.is_empty() {
@@ -735,7 +854,15 @@ impl App {
         let rows = self.output_rows();
         let n = rows.len();
         let kind = if self.selected.is_empty() { "rows" } else { "selected rows" };
-        match std::fs::write(&out, to_text(&rows, &self.zone_label())) {
+        // What the rows are: the snapshot and the filters that picked them.
+        let mut head = format!("Snapshot: {}\r\n", file_name(&d.path));
+        head.push_str(&format!("Times: console local, {}\r\n", d.clock.zone()));
+        for l in self.filter_lines() {
+            head.push_str(&l);
+            head.push_str("\r\n");
+        }
+        head.push_str(&format!("Rows: {n} ({})\r\n\r\n", self.output_what()));
+        match std::fs::write(&out, head + &to_text(&rows, &self.zone_label())) {
             Ok(()) => self.message = Message::Good(format!("Saved {n} {kind} to {}", out.display())),
             Err(e) => self.message = error(format!("Could not save {}: {e}", out.display())),
         }
@@ -994,15 +1121,365 @@ fn time_box(ui: &mut egui::Ui, value: &mut String, state: BoxState) -> bool {
     r.changed()
 }
 
-fn source_color(s: Source) -> Option<Color32> {
-    match s {
-        Source::Audit => None,
-        Source::Alarm => Some(AMBER),
-        Source::Test => Some(BLUE),
+/// The Source tag's color, one per kind (hues close within a group). None:
+/// plain text, for the audit rows people read most (and Log Management,
+/// which gets an outline).
+fn kind_color(k: Kind) -> Option<Color32> {
+    let rgb = |r, g, b| Some(Color32::from_rgb(r, g, b));
+    match k {
+        Kind::Audit | Kind::LogManagement => None,
+        Kind::Alarm => Some(AMBER),
+        Kind::AlarmPeriod => rgb(215, 140, 90),
+        Kind::ManualTest => Some(BLUE),
+        Kind::AutoTest => rgb(90, 195, 235),
+        Kind::Csld => rgb(145, 140, 240),
+        Kind::LineTest => rgb(70, 200, 190),
+        Kind::LineDiag => rgb(120, 190, 145),
+        Kind::Compliance => rgb(140, 205, 85),
+        Kind::Delivery => rgb(180, 140, 240),
+        Kind::Inventory => rgb(215, 130, 215),
+        Kind::Power => rgb(235, 105, 130),
+        Kind::AppLog => rgb(135, 165, 205),
+        Kind::AutoEvent => rgb(185, 180, 95),
+        Kind::ProgramLog => rgb(160, 160, 160),
+        Kind::Isd => rgb(190, 145, 110),
     }
 }
 
+/// A tag's fill and text color: tinted with brighter text in dark mode,
+/// tinted with much darker text in light mode (readable at small size), solid
+/// with black text on a selected row.
+fn tag_colors(c: Color32, dark: bool, selected: bool) -> (Color32, Color32) {
+    if selected {
+        (c, Color32::BLACK)
+    } else if dark {
+        (c.gamma_multiply(0.18), c.lerp_to_gamma(Color32::WHITE, 0.25))
+    } else {
+        (c.gamma_multiply(0.22), c.lerp_to_gamma(Color32::BLACK, 0.62))
+    }
+}
+
+/// A row passes the Show ticks: its kind is ticked, and it is not a Log
+/// Management entry repeating an audit row that is shown anyway.
+fn kind_shown(kinds: &KindSet, r: &Row) -> bool {
+    kinds[r.kind.index()] && !(r.repeat && kinds[Kind::Audit.index()])
+}
+
+/// The Search box: words that must all appear, "quoted phrases" that must
+/// appear as typed, and -words (or -"phrases") that must not appear. Case is
+/// ignored. A lone "-" is an ordinary word.
+#[derive(Debug, Default, PartialEq)]
+struct Search {
+    want: Vec<String>,
+    not: Vec<String>,
+}
+
+impl Search {
+    fn parse(s: &str) -> Search {
+        let s = s.to_lowercase();
+        let mut out = Search::default();
+        let mut chars = s.chars().peekable();
+        loop {
+            while chars.next_if(|c| c.is_whitespace()).is_some() {}
+            let Some(&c) = chars.peek() else { break };
+            let mut neg = false;
+            if c == '-' {
+                chars.next();
+                match chars.peek() {
+                    None => {
+                        out.want.push("-".into());
+                        break;
+                    }
+                    Some(n) if n.is_whitespace() => {
+                        out.want.push("-".into());
+                        continue;
+                    }
+                    _ => neg = true,
+                }
+            }
+            let mut term = String::new();
+            if chars.next_if_eq(&'"').is_some() {
+                // A phrase runs to the closing quote (or the end of the box).
+                for c in chars.by_ref() {
+                    if c == '"' {
+                        break;
+                    }
+                    term.push(c);
+                }
+            } else {
+                while let Some(c) = chars.next_if(|c| !c.is_whitespace()) {
+                    term.push(c);
+                }
+            }
+            let term = term.trim().to_string();
+            if term.is_empty() {
+                continue;
+            }
+            if neg {
+                out.not.push(term);
+            } else {
+                out.want.push(term);
+            }
+        }
+        out
+    }
+
+    fn matches(&self, hay: &str) -> bool {
+        self.want.iter().all(|w| hay.contains(w.as_str())) && !self.not.iter().any(|w| hay.contains(w.as_str()))
+    }
+}
+
+/// A drop-down list with "All" first and a box at the top that narrows the
+/// list as you type (Enter picks the first match). The box takes the keyboard
+/// once, when the list opens, so Tab and the arrow keys still move on. A
+/// choice no longer in `items` (its kinds were unticked) stays chosen and is
+/// marked, so it is never dropped without a word.
+fn pick_list(
+    ui: &mut egui::Ui,
+    id: &str,
+    width: f32,
+    value: &mut String,
+    items: &[String],
+    find: &mut String,
+    noun: &str,
+) -> egui::Response {
+    let stale = !value.is_empty() && !items.contains(value);
+    let text = if value.is_empty() {
+        "All".to_string()
+    } else if stale {
+        format!("{value} (none in kinds shown)")
+    } else {
+        value.clone()
+    };
+    let opened_id = egui::Id::new((id, "opened"));
+    let r = egui::ComboBox::from_id_salt(id)
+        .width(width)
+        .height(420.0)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            let te = ui.add(
+                TextEdit::singleline(find)
+                    .id(egui::Id::new((id, "find")))
+                    .hint_text("Type to narrow the list")
+                    .desired_width(width.clamp(160.0, 260.0)),
+            );
+            let first_frame = !ui.data(|d| d.get_temp::<bool>(opened_id).unwrap_or(false));
+            if first_frame {
+                ui.data_mut(|d| d.insert_temp(opened_id, true));
+                te.request_focus();
+            }
+            ui.separator();
+            let needle = find.trim().to_lowercase();
+            let matching: Vec<&String> = items
+                .iter()
+                .filter(|it| needle.is_empty() || it.to_lowercase().contains(&needle))
+                .collect();
+            if te.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                // An empty box keeps the choice as it is; text picks the first match.
+                if !needle.is_empty()
+                    && let Some(first) = matching.first()
+                {
+                    *value = (*first).clone();
+                }
+                ui.close();
+            }
+            if ui.selectable_label(value.is_empty(), "All").clicked() {
+                value.clear();
+                ui.close();
+            }
+            if stale && ui.selectable_label(true, format!("{value} (none in kinds shown)")).clicked() {
+                ui.close();
+            }
+            for it in &matching {
+                if ui.selectable_label(*value == **it, it.as_str()).clicked() {
+                    *value = (*it).clone();
+                    ui.close();
+                }
+            }
+            if matching.is_empty() {
+                ui.weak(if items.is_empty() {
+                    format!("No {noun} in the kinds shown")
+                } else {
+                    "No match".to_string()
+                });
+            }
+        });
+    if r.inner.is_none() {
+        find.clear();
+        ui.data_mut(|d| d.remove::<bool>(opened_id));
+    }
+    r.response
+}
+
 impl App {
+    /// The Show panel: a tick box for each kind of event, in groups, with how
+    /// many rows of it match the other filters.
+    fn show_panel_ui(&mut self, ui: &mut egui::Ui) {
+        let has_data = self.data.is_some();
+        // Secondary text: lighter than body text but still readable (the theme's
+        // own "weak" color is too faint at small sizes).
+        let soft = ui.visuals().text_color().gamma_multiply(0.72);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Show").strong().size(15.0));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui
+                    .small_button("Hide")
+                    .on_hover_text("Fold this panel away (the Filter row then has a Show button)")
+                    .clicked()
+                {
+                    self.show_panel = false;
+                    self.auto_folded = false;
+                }
+            });
+        });
+        ui.add_enabled_ui(has_data, |ui| {
+            ui.horizontal(|ui| {
+                let names: Vec<&str> = Kind::ALL.iter().filter(|k| k.default_on()).map(|k| k.name()).collect();
+                if ui
+                    .small_button("Defaults")
+                    .on_hover_text(format!("Tick only: {}", names.join(", ")))
+                    .clicked()
+                {
+                    self.filters.kinds = kind::defaults();
+                }
+                if ui.small_button("All").on_hover_text("Tick every kind").clicked() {
+                    self.filters.kinds = [true; Kind::COUNT];
+                }
+                if ui.small_button("None").on_hover_text("Untick every kind").clicked() {
+                    self.filters.kinds = [false; Kind::COUNT];
+                }
+            });
+            ui.label(
+                RichText::new("Right-click or Alt+click a kind to show only it.")
+                    .small()
+                    .color(soft),
+            );
+            if has_data && !self.filters.user.is_empty() {
+                ui.label(
+                    RichText::new("A User is chosen: only audit trail and log management rows have a user.")
+                        .small()
+                        .color(AMBER),
+                );
+            }
+            ui.separator();
+            let range_bad = self.range_error.is_some();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                // Room on the right so the scroll bar never covers the counts.
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        right: 12,
+                        ..Default::default()
+                    })
+                    .show(ui, |ui| {
+                        for (group, kinds) in GROUPS {
+                            ui.add_space(4.0);
+                            let all_on = kinds.iter().all(|k| self.filters.kinds[k.index()]);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(group.to_uppercase()).small().strong().color(soft));
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    // A small link that says what it does to the group.
+                                    let r = ui
+                                        .add(egui::Link::new(
+                                            RichText::new(if all_on { "Untick all" } else { "Tick all" }).small(),
+                                        ))
+                                        .on_hover_text(if all_on {
+                                            format!("Untick every kind in {group}")
+                                        } else {
+                                            format!("Tick every kind in {group}")
+                                        });
+                                    if r.clicked() {
+                                        for k in kinds.iter() {
+                                            self.filters.kinds[k.index()] = !all_on;
+                                        }
+                                    }
+                                });
+                            });
+                            for &k in kinds.iter() {
+                                self.kind_row(ui, k, has_data, range_bad, soft);
+                            }
+                        }
+                    });
+            });
+        });
+    }
+
+    /// One kind in the Show panel: swatch, tick box, name and count.
+    fn kind_row(&mut self, ui: &mut egui::Ui, k: Kind, has_data: bool, range_bad: bool, soft: Color32) {
+        let total = self.totals[k.index()];
+        let count = self.counts[k.index()];
+        let empty = has_data && total == 0;
+        let repeats = if k == Kind::LogManagement && self.filters.kinds[Kind::Audit.index()] {
+            self.repeats
+        } else {
+            0
+        };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(9.0, 9.0), egui::Sense::hover());
+            match kind_color(k) {
+                Some(c) => {
+                    ui.painter().rect_filled(rect, 2.0, c);
+                }
+                None => {
+                    ui.painter()
+                        .rect_stroke(rect, 2.0, egui::Stroke::new(1.0, soft), egui::StrokeKind::Inside);
+                }
+            }
+            let mut tip = k.about().to_string();
+            if empty {
+                tip.push_str("\n\nThis snapshot has none.");
+            } else if has_data {
+                tip.push_str(&format!(
+                    "\n\n{count} of the {total} in this snapshot match the time range, User, Device and Search."
+                ));
+                if repeats > 0 {
+                    tip.push_str(&format!(" The {repeats} that repeat audit trail rows are not counted."));
+                }
+            }
+            tip.push_str("\nRight-click or Alt+click: show only this kind.");
+            // A kind the snapshot doesn't have shows an empty, disabled box (its
+            // tick is kept for the next snapshot).
+            let r = if empty {
+                let mut off = false;
+                ui.add_enabled(false, egui::Checkbox::new(&mut off, ""));
+                ui.add(Label::new(RichText::new(k.name()).color(soft)).selectable(false))
+                    .on_hover_text(tip)
+            } else {
+                let mut on = self.filters.kinds[k.index()];
+                let r = ui.checkbox(&mut on, k.name()).on_hover_text(tip);
+                if r.clicked() && ui.input(|i| i.modifiers.alt) {
+                    self.filters.kinds = [false; Kind::COUNT];
+                    self.filters.kinds[k.index()] = true;
+                } else if r.changed() {
+                    self.filters.kinds[k.index()] = on;
+                }
+                r
+            };
+            r.context_menu(|ui| {
+                if ui.button(format!("Show only {}", k.name())).clicked() {
+                    self.filters.kinds = [false; Kind::COUNT];
+                    self.filters.kinds[k.index()] = true;
+                    ui.close();
+                }
+            });
+            if has_data {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let on = self.filters.kinds[k.index()] && !empty;
+                    let n = if empty {
+                        "none".to_string()
+                    } else if range_bad {
+                        "-".to_string()
+                    } else {
+                        count.to_string()
+                    };
+                    let color = if on { ui.visuals().strong_text_color() } else { soft };
+                    ui.add(Label::new(RichText::new(n).monospace().color(color)).selectable(false));
+                });
+            }
+        });
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let has_data = self.data.is_some();
         let can = self.nothing_reason().is_none();
@@ -1037,7 +1514,11 @@ impl App {
             }
             let r = ui.add_enabled(can, egui::Button::new(copy_txt));
             mark(ui, &r);
-            if r.on_hover_text(format!("Copies {what}, as in the .txt")).clicked() {
+            if r.on_hover_text(format!(
+                "Copies {what}, as in the .txt (the rows only, without the filter lines at its top)"
+            ))
+            .clicked()
+            {
                 self.copy(ctx);
             }
             if picked && ui.button("Clear selection").on_hover_text("Esc").clicked() {
@@ -1046,10 +1527,25 @@ impl App {
                 ctx.request_repaint();
             }
             ui.add_enabled_ui(has_data, |ui| {
-                if ui.button("Reset filters").clicked() {
+                if ui
+                    .button("Reset filters")
+                    .on_hover_text("Every filter back to its start, the Show ticks to Defaults")
+                    .clicked()
+                {
                     self.reset_filters();
                 }
             });
+            if self.before_around.is_some()
+                && ui
+                    .button("Back to previous filters")
+                    .on_hover_text(
+                        "Undo \"Show all events within 15 min\": the time range, kinds, User, Device and Search from before \
+                         (changes made since are dropped)",
+                    )
+                    .clicked()
+            {
+                self.back_from_around();
+            }
         });
         ui.add_enabled_ui(has_data, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1090,52 +1586,41 @@ impl App {
                 }
             });
             ui.horizontal_wrapped(|ui| {
-                row_label(ui, "Show");
-                let tests_tip = "Leak tests appear when they end. The console does not record who starts them.";
-                ui.checkbox(&mut self.filters.audit, "Audit trail");
-                ui.checkbox(&mut self.filters.alarms, "Alarms");
-                ui.checkbox(&mut self.filters.manual_tests, "Manual leak tests")
-                    .on_hover_text(tests_tip);
-                ui.checkbox(&mut self.filters.auto_tests, "Automatic leak tests")
-                    .on_hover_text(tests_tip);
-            });
-            ui.horizontal_wrapped(|ui| {
                 row_label(ui, "Filter");
+                if !self.show_panel {
+                    let on = self.filters.kinds.iter().filter(|k| **k).count();
+                    let hidden = self.hidden_matches();
+                    let tip = if hidden > 0 {
+                        format!("Open the Show panel to pick the kinds of event. {hidden} more rows match in kinds not ticked.")
+                    } else {
+                        "Open the Show panel to pick the kinds of event".to_string()
+                    };
+                    if ui
+                        .button(format!("Show: {on} of {} kinds", Kind::COUNT))
+                        .on_hover_text(tip)
+                        .clicked()
+                    {
+                        self.show_panel = true;
+                        self.auto_folded = false;
+                    }
+                }
                 ui.horizontal(|ui| {
                     ui.label("User");
-                    let user_txt = if self.filters.user.is_empty() {
-                        "All".to_string()
-                    } else {
-                        self.filters.user.clone()
-                    };
-                    egui::ComboBox::from_id_salt("user")
-                        .width(170.0)
-                        .selected_text(user_txt)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.filters.user, String::new(), "All");
-                            for u in &self.users {
-                                ui.selectable_value(&mut self.filters.user, u.clone(), u.as_str());
-                            }
-                        })
-                        .response
-                        .on_hover_text("Only audit trail rows have a user");
+                    pick_list(ui, "user", 170.0, &mut self.filters.user, &self.users, &mut self.user_find, "users")
+                        .on_hover_text("Only audit trail and log management rows have a user: choosing one hides every other kind");
                 });
                 ui.horizontal(|ui| {
                     ui.label("Device");
-                    let dev_txt = if self.filters.device.is_empty() {
-                        "All".to_string()
-                    } else {
-                        self.filters.device.clone()
-                    };
-                    egui::ComboBox::from_id_salt("device")
-                        .width(190.0)
-                        .selected_text(dev_txt)
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.filters.device, String::new(), "All");
-                            for d in &self.devices {
-                                ui.selectable_value(&mut self.filters.device, d.clone(), d.as_str());
-                            }
-                        });
+                    pick_list(
+                        ui,
+                        "device",
+                        190.0,
+                        &mut self.filters.device,
+                        &self.devices,
+                        &mut self.device_find,
+                        "devices",
+                    )
+                    .on_hover_text("The devices of the kinds of event ticked under Show");
                 });
                 ui.separator();
                 ui.horizontal(|ui| {
@@ -1144,9 +1629,12 @@ impl App {
                         TextEdit::singleline(&mut self.filters.search)
                             .id(egui::Id::new("search"))
                             .desired_width((ui.available_width() - 40.0).clamp(200.0, 420.0))
-                            .hint_text("words, all must match"),
+                            .hint_text("words, \"a phrase\", -not"),
                     );
-                    let r = r.on_hover_text("Ctrl+F. Every word must appear somewhere in the row. Esc clears.");
+                    let r = r.on_hover_text(
+                        "Ctrl+F. Every word must appear somewhere in the row. \"Quotes\" match a phrase as typed; \
+                         -word or -\"phrase\" leaves out rows that have it. Case is ignored. Esc clears.",
+                    );
                     if self.focus_search {
                         r.request_focus();
                         self.focus_search = false;
@@ -1175,7 +1663,17 @@ impl App {
                     }
                     ui.label(file_name(&d.path)).on_hover_text(tip);
                     ui.separator();
-                    ui.label(format!("Showing {} of {}", self.shown.len(), d.rows.len()));
+                    let hidden = self.hidden_matches();
+                    let mut tip = format!("{} rows in this snapshot.\n{}", d.rows.len(), self.filter_lines().join("\n"));
+                    if hidden > 0 {
+                        tip.push_str(&format!("\n{hidden} more rows match but are in kinds not ticked under Show."));
+                    }
+                    let showing = if hidden > 0 && self.range_error.is_none() {
+                        format!("Showing {} ({hidden} more in kinds not ticked)", self.shown.len())
+                    } else {
+                        format!("Showing {}", self.shown.len())
+                    };
+                    ui.label(showing).on_hover_text(tip);
                     if !self.selected.is_empty() {
                         ui.label(format!("({} selected)", self.selected.len()));
                     }
@@ -1184,14 +1682,66 @@ impl App {
                         ui.label(RichText::new(format!("Sorted by {col}, {dir}")).strong());
                     }
                     ui.separator();
-                    ui.label(format!("Times: {}", d.clock.zone()));
+                    ui.label(format!("Times: {}", d.clock.name)).on_hover_text(if d.clock.fixed {
+                        format!(
+                            "Console local time: {}. The console's time zone is not one this program knows, so this \
+                                 fixed offset (from its status log, or UTC if that has none) is used all year, without daylight saving.",
+                            d.clock.zone()
+                        )
+                    } else {
+                        format!("Console local time: {}", d.clock.zone())
+                    });
+                    // Anything about how the snapshot was read: one item, details on hover.
+                    let mut notes: Vec<(String, bool)> = vec![];
                     if !d.missing.is_empty() {
-                        ui.separator();
-                        ui.label(RichText::new(format!("Not in this snapshot: {}", d.missing.join(", "))).color(RED));
+                        notes.push((format!("Not in this snapshot: {}.", d.missing.join(", ")), true));
+                    }
+                    if !d.unreadable.is_empty() {
+                        notes.push((
+                            format!(
+                                "These tables are in the snapshot but not laid out as expected, so they were not read: {}.",
+                                d.unreadable.join(", ")
+                            ),
+                            true,
+                        ));
                     }
                     if d.skipped > 0 {
+                        notes.push((
+                            format!("{} rows could not be read (a damaged time or value) and were skipped.", d.skipped),
+                            true,
+                        ));
+                    }
+                    let no_time: usize = d.no_time.iter().sum();
+                    if no_time > 0 {
+                        let list: Vec<String> = Kind::ALL
+                            .iter()
+                            .filter(|k| d.no_time[k.index()] > 0)
+                            .map(|k| format!("{} {}", d.no_time[k.index()], k.name()))
+                            .collect();
+                        notes.push((
+                            format!(
+                                "{no_time} rows have no date and time (the console saved them that way, for example at power up \
+                                 before its clock ran), so they can't be placed in the list: {}.",
+                                list.join(", ")
+                            ),
+                            false,
+                        ));
+                    }
+                    if !notes.is_empty() {
+                        let bad = notes.iter().any(|n| n.1);
+                        let short = if notes.len() == 1 && !bad {
+                            format!("{no_time} without a time")
+                        } else {
+                            format!("Notices ({})", notes.len())
+                        };
+                        let t = if bad {
+                            RichText::new(short).color(RED)
+                        } else {
+                            RichText::new(short)
+                        };
                         ui.separator();
-                        ui.label(RichText::new(format!("{} unreadable rows skipped", d.skipped)).color(RED));
+                        ui.label(t)
+                            .on_hover_text(notes.iter().map(|n| n.0.as_str()).collect::<Vec<_>>().join("\n\n"));
                     }
                 }
                 None if self.loading.is_none() => {
@@ -1277,17 +1827,19 @@ impl eframe::App for App {
             self.focus_search = true;
         }
         let focused = ctx.memory(|m| m.focused());
+        // Typing goes to a text box only; a focused tick box or button doesn't count.
+        let typing = ctx.egui_wants_keyboard_input();
         if k_esc {
             if focused == Some(egui::Id::new("search")) {
                 self.filters.search.clear();
-            } else if focused.is_none() && !ctx.any_popup_open() {
+            } else if !typing && !ctx.any_popup_open() {
                 self.selected.clear();
                 self.anchor = None;
             }
         }
         // Ctrl+A selects every row shown, unless a text box has focus (then it
         // selects that box's text as usual).
-        if focused.is_none() && self.data.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) {
+        if !typing && self.data.is_some() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::A)) {
             self.refilter();
             self.select_all();
         }
@@ -1311,8 +1863,33 @@ impl eframe::App for App {
         // Changes made in the toolbar this frame are shown this frame.
         self.refilter();
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui));
+        // The Show panel folds itself away when the window gets narrow, and comes
+        // back when it is wide again (if it was folded that way).
+        let width = ctx.content_rect().width();
+        let was = self.last_width.unwrap_or(f32::MAX);
+        if width < NARROW && was >= NARROW && self.show_panel {
+            self.show_panel = false;
+            self.auto_folded = true;
+        } else if width >= NARROW && was < NARROW && self.auto_folded {
+            self.show_panel = true;
+            self.auto_folded = false;
+        }
+        self.last_width = Some(width);
+        if self.show_panel {
+            egui::Panel::left("show")
+                .resizable(true)
+                .default_size(236.0)
+                .size_range(210.0..=360.0)
+                .show(ui, |ui| {
+                    ui.add_space(6.0);
+                    self.show_panel_ui(ui);
+                });
+            // Ticks changed in the panel are shown this frame.
+            self.refilter();
+        }
 
         let mut reset = false;
+        let mut empty_action: Option<EmptyAction> = None;
         let mut open_clicked = false;
         let mut clicked: Option<(usize, bool, bool)> = None;
         // (row, select every row in the window too)
@@ -1343,11 +1920,41 @@ impl eframe::App for App {
                         ui.label(RichText::new("No rows: the time range isn't valid").size(16.0));
                         ui.add_space(6.0);
                         ui.label("Fix the boxes outlined in red above, or reset the filters.");
+                    } else if !self.filters.kinds.contains(&true) {
+                        ui.label(RichText::new("No kind of event is ticked under Show.").size(16.0));
+                        ui.add_space(6.0);
+                        ui.label("Tick one in the Show panel, or:");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            // Centered: the row's own width is unknown until drawn.
+                            ui.add_space((ui.available_width() - 260.0).max(0.0) / 2.0);
+                            if ui.button("Show the defaults").clicked() {
+                                empty_action = Some(EmptyAction::Defaults);
+                            }
+                            if ui.button("Show every kind").clicked() {
+                                empty_action = Some(EmptyAction::All);
+                            }
+                        });
                     } else {
                         ui.label(RichText::new("No events match the filters.").size(16.0));
+                        ui.add_space(6.0);
+                        let hidden = self.hidden_matches();
+                        if hidden > 0 {
+                            ui.label(format!("{hidden} rows match in kinds that are not ticked under Show."));
+                            ui.add_space(8.0);
+                            if ui.button("Tick those kinds").clicked() {
+                                empty_action = Some(EmptyAction::Matching);
+                            }
+                        } else {
+                            ui.label(format!("Filtering by: {}", self.filter_lines().join("; ")));
+                        }
                     }
                     ui.add_space(8.0);
-                    if ui.button("Reset filters").clicked() {
+                    if ui
+                        .button("Reset filters")
+                        .on_hover_text("Every filter back to its start, the Show ticks to Defaults")
+                        .clicked()
+                    {
                         reset = true;
                     }
                 });
@@ -1359,7 +1966,7 @@ impl eframe::App for App {
             let mods = ctx.input(|i| i.modifiers);
             let mut copy: Option<(usize, bool)> = None;
             // Table min width: fixed columns + Event's minimum. Narrower windows scroll sideways.
-            const MIN_TABLE: f32 = 156.0 + 62.0 + 80.0 + 70.0 + 160.0 + 70.0 + 60.0 + 7.0 * 8.0;
+            const MIN_TABLE: f32 = 156.0 + 88.0 + 80.0 + 70.0 + 160.0 + 70.0 + 60.0 + 7.0 * 8.0;
             egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_min_width(MIN_TABLE.max(ui.available_width()));
                 // Row hover: a blue-gray that stands apart from the gray stripes
@@ -1386,7 +1993,7 @@ impl eframe::App for App {
                     .sense(egui::Sense::click())
                     .cell_layout(Layout::left_to_right(Align::Center))
                     .column(Column::exact(156.0))
-                    .column(Column::exact(62.0).clip(true))
+                    .column(Column::exact(88.0).clip(true))
                     .column(Column::initial(w_dev).at_least(80.0).clip(true))
                     .column(Column::initial(w_user).at_least(70.0).clip(true))
                     .column(Column::remainder().at_least(160.0).clip(true))
@@ -1436,29 +2043,31 @@ impl eframe::App for App {
                             row.set_selected(is_sel);
                             for (i, v) in r.columns().iter().enumerate() {
                                 row.col(|ui| {
-                                    // ALARM and TEST are a small rounded tag on every row:
+                                    // Each kind's Source is a small rounded tag on every row:
                                     // a tinted tag with colored text normally, a solid tag
                                     // with dark text on a selected row (readable on the
                                     // selection blue, and the same shape either way).
-                                    // AUDIT goes through the same frame (no fill) so all three
-                                    // line up.
+                                    // AUDIT and LOG MGMT go through the same frame (no fill)
+                                    // so every tag lines up.
                                     if i == 1 {
                                         let dark = ui.visuals().dark_mode;
-                                        let (fill, text) = match source_color(r.source) {
-                                            Some(c) if is_sel => (c, Color32::BLACK),
-                                            // Text brighter (dark mode) or darker (light mode)
-                                            // than the tint, for contrast.
-                                            Some(c) if dark => (c.gamma_multiply(0.18), c.lerp_to_gamma(Color32::WHITE, 0.25)),
-                                            Some(c) => (c.gamma_multiply(0.25), c.lerp_to_gamma(Color32::BLACK, 0.45)),
+                                        let (fill, text) = match kind_color(r.kind) {
+                                            Some(c) => tag_colors(c, dark, is_sel),
                                             None => (Color32::TRANSPARENT, strong),
                                         };
-                                        let bold = r.source != Source::Audit;
+                                        let outline = if r.kind == Kind::LogManagement {
+                                            egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.fg_stroke.color.gamma_multiply(0.55))
+                                        } else {
+                                            egui::Stroke::NONE
+                                        };
+                                        let bold = kind_color(r.kind).is_some();
                                         let mut t = RichText::new(*v).color(text);
                                         if bold {
                                             t = t.strong();
                                         }
                                         egui::Frame::new()
                                             .fill(fill)
+                                            .stroke(outline)
                                             .corner_radius(3)
                                             .inner_margin(egui::Margin::symmetric(4, 0))
                                             .show(ui, |ui| {
@@ -1574,6 +2183,15 @@ impl eframe::App for App {
         if reset {
             self.reset_filters();
         }
+        match empty_action {
+            Some(EmptyAction::Defaults) => self.filters.kinds = kind::defaults(),
+            Some(EmptyAction::All) => self.filters.kinds = [true; Kind::COUNT],
+            Some(EmptyAction::Matching) => self.tick_matching_kinds(),
+            None => {}
+        }
+        if empty_action.is_some() {
+            ctx.request_repaint();
+        }
         if open_clicked {
             self.pick_and_open();
         }
@@ -1607,14 +2225,50 @@ mod tests {
         Row {
             utc: 0,
             time: time.into(),
-            source: Source::Audit,
-            manual: false,
-            device: String::new(),
             user: user.into(),
             event: event.into(),
             value: value.into(),
-            previous: String::new(),
+            ..Row::default()
         }
+    }
+
+    #[test]
+    fn search_words_phrases_and_exclusions() {
+        let s = Search::parse(r#"Leak  "tank 1" -alarm -"no result" - "#);
+        assert_eq!(s.want, ["leak", "tank 1", "-"]);
+        assert_eq!(s.not, ["alarm", "no result"]);
+        assert!(s.matches("manual static leak test tank 1 passed -"));
+        assert!(!s.matches("manual static leak test tank 1 passed"));
+        assert!(!s.matches("leak alarm tank 1 -"));
+        assert!(!s.matches("leak tank 1 no result -"));
+        // An unclosed quote runs to the end; empty terms are ignored.
+        let s = Search::parse(r#"-"" "" "open phrase"#);
+        assert_eq!(
+            s,
+            Search {
+                want: vec!["open phrase".into()],
+                not: vec![]
+            }
+        );
+        assert!(Search::parse("   ").matches("anything"));
+        assert_eq!(Search::parse("a-b -c-d").want, ["a-b"]);
+        assert_eq!(Search::parse("a-b -c-d").not, ["c-d"]);
+    }
+
+    #[test]
+    fn log_management_repeats_hide_only_with_audit() {
+        let mut r = row("2026-01-01 00:00:00", "u", "e", "v");
+        r.kind = Kind::LogManagement;
+        r.repeat = true;
+        let mut k = [false; Kind::COUNT];
+        k[Kind::LogManagement.index()] = true;
+        assert!(kind_shown(&k, &r));
+        k[Kind::Audit.index()] = true;
+        assert!(!kind_shown(&k, &r));
+        r.repeat = false;
+        assert!(kind_shown(&k, &r));
+        k[Kind::LogManagement.index()] = false;
+        assert!(!kind_shown(&k, &r));
     }
 
     #[test]
