@@ -1,7 +1,7 @@
 //! Reads a TLS-450 Plus snapshot .tar into a flat list of events:
 //! audit trail entries, alarm events and static (SLD) leak test starts/ends.
 //!
-//! Where it reads from (see README.md):
+//! Where it reads from (see docs/DEVELOPMENT.md):
 //! - databases.tgz: the console's SQLite `.tls` files (times are Unix seconds, UTC).
 //! - etc.tgz > etc/timezone: the console's time zone (`TZ=":US/Mountain"`);
 //!   status.log's `=== date time -0700 ===` lines are the fallback.

@@ -8,7 +8,7 @@
 const PRODUCT: &str = "TLS-450 Plus Snapshot Audit Log Tool";
 const DESCRIPTION: &str = "TLS-450 Plus Snapshot Audit Log Tool";
 const AUTHOR: &str = "Verbose Software";
-const COPYRIGHT: &str = "Copyright (c) 2026 Verbose Software. All rights reserved.";
+const COPYRIGHT: &str = "Copyright (c) 2026 Verbose Software. MIT License.";
 const EXE: &str = "TLS-450-Plus-Snapshot-Audit-Log-Tool.exe";
 
 fn main() {
