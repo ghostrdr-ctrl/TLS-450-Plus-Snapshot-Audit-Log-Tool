@@ -325,7 +325,7 @@ impl App {
                 let Some(r) = finished else { return };
                 let release = release.clone();
                 match r {
-                    Err(e) if e == "cancelled" => self.update = UpdateState::Available(release),
+                    Err(e) if e == "canceled" => self.update = UpdateState::Available(release),
                     Err(e) => self.update = UpdateState::Failed { release, error: e },
                     Ok(tmp) => self.install(ctx, release, &tmp),
                 }
@@ -1017,7 +1017,7 @@ impl App {
             let n = if can { n_out } else { 0 };
             (format!("Save {n} rows to .txt..."), format!("Copy {n} rows"))
         };
-        // A selection is marked with an outline in the selection colour, painted
+        // A selection is marked with an outline in the selection color, painted
         // over the button so its size doesn't change; the blue fill is kept for
         // the selected rows themselves.
         let sel_stroke = egui::Stroke::new(1.5, ui.visuals().selection.bg_fill);
@@ -1362,8 +1362,8 @@ impl eframe::App for App {
             const MIN_TABLE: f32 = 156.0 + 62.0 + 80.0 + 70.0 + 160.0 + 70.0 + 60.0 + 7.0 * 8.0;
             egui::ScrollArea::horizontal().auto_shrink([false, false]).show(ui, |ui| {
                 ui.set_min_width(MIN_TABLE.max(ui.available_width()));
-                // Row hover: a blue-grey that stands apart from the grey stripes
-                // (set for the table only; buttons keep their own hover colour).
+                // Row hover: a blue-gray that stands apart from the gray stripes
+                // (set for the table only; buttons keep their own hover color).
                 ui.visuals_mut().widgets.hovered.bg_fill = if ui.visuals().dark_mode {
                     Color32::from_rgb(52, 66, 86)
                 } else {
@@ -1437,7 +1437,7 @@ impl eframe::App for App {
                             for (i, v) in r.columns().iter().enumerate() {
                                 row.col(|ui| {
                                     // ALARM and TEST are a small rounded tag on every row:
-                                    // a tinted tag with coloured text normally, a solid tag
+                                    // a tinted tag with colored text normally, a solid tag
                                     // with dark text on a selected row (readable on the
                                     // selection blue, and the same shape either way).
                                     // AUDIT goes through the same frame (no fill) so all three

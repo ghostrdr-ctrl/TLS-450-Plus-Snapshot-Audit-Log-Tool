@@ -81,7 +81,7 @@ def draw(size: int) -> Image.Image:
     # finished with a T-cap (a hooked end reads as a faucet over a bathtub).
     if not small:
         vw = (3 if detail else 5) * u
-        px = left + w * 0.2  # pipe centre
+        px = left + w * 0.2  # pipe center
         vt = gy - (11 if detail else 13) * u  # top of the pipe
         d.rectangle([px - vw / 2, vt, px + vw / 2, top + outline], fill=WHITE)
         cap = (5 if detail else 6) * u

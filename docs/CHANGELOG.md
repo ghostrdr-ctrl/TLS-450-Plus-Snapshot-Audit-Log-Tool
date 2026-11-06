@@ -9,6 +9,11 @@ punctuation only.
 
 Newest first. Each heading is `## <version>` and must match `version` in `Cargo.toml`.
 
+## 0.3.1
+
+- US English spelling throughout.
+- First release built and published by GitHub, with the in-app updater from 0.3.0.
+
 ## 0.3.0
 
 - Updates: at start the program checks GitHub for a newer version and offers it in a strip above
@@ -28,7 +33,7 @@ Newest first. Each heading is `## <version>` and must match `version` in `Cargo.
   Time sorted newest first is the default and replaces the "Newest first" box.
 - Numbers sort as numbers (-166.2 before -84.1, Tank 2 before Tank 10).
 - A sort other than the default shows in the status bar and in the Save/Copy hover.
-- ALARM and TEST show as small coloured tags.
+- ALARM and TEST show as small colored tags.
 - The app has its own icon.
 
 ## 0.1.1
@@ -39,7 +44,7 @@ Newest first. Each heading is `## <version>` and must match `version` in `Cargo.
 - The save dialog suggests a file name with the time span of the rows being saved.
 - All columns fit in a narrow window.
 - Clearer highlighting: hovered rows, selected rows and the Save/Copy buttons are easier to tell
-  apart, and selected rows keep their ALARM/TEST colour.
+  apart, and selected rows keep their ALARM/TEST color.
 - Shift+click keeps working after Ctrl+A.
 
 ## 0.1.0

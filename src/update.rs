@@ -327,7 +327,7 @@ fn save_verified(reader: impl Read, asset: &Asset, out: &Path, progress: &dyn Fn
     let mut head = [0u8; 2];
     loop {
         if cancel.load(Ordering::Relaxed) {
-            return Err("cancelled".into());
+            return Err("canceled".into());
         }
         let n = reader.read(&mut buf).map_err(|e| format!("the download stopped ({e})"))?;
         if n == 0 {
@@ -545,7 +545,7 @@ mod tests {
         assert_eq!(std::fs::read(&out).unwrap(), body);
         assert_eq!(seen.get(), body.len() as u64);
 
-        // Wrong hash, short, long, not a program, cancelled.
+        // Wrong hash, short, long, not a program, canceled.
         let mut wrong = a.clone();
         wrong.sha256[0] ^= 1;
         assert!(
@@ -571,7 +571,7 @@ mod tests {
                 .contains("Windows")
         );
         let yes = AtomicBool::new(true);
-        assert_eq!(save_verified(&body[..], &a, &out, &|_, _| {}, &yes).unwrap_err(), "cancelled");
+        assert_eq!(save_verified(&body[..], &a, &out, &|_, _| {}, &yes).unwrap_err(), "canceled");
         let _ = std::fs::remove_dir_all(&d);
     }
 

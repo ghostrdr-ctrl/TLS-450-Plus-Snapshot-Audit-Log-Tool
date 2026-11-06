@@ -2,3 +2,5 @@
 /dist
 *.tar
 *.txt
+# A Linux cargo run turns the Windows target-dir setting into this folder.
+/C:/
