@@ -11,8 +11,7 @@ Newest first. Each heading is `## <version>` and must match `version` in `Cargo.
 
 ## 0.3.1
 
-- US English spelling throughout.
-- First release built and published by GitHub, with the in-app updater from 0.3.0.
+- First release published on GitHub, including the update check from 0.3.0.
 
 ## 0.3.0
 
