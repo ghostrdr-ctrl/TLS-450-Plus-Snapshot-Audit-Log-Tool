@@ -1,0 +1,3 @@
+# Windows build output stays out of the project folder (disposable cache).
+[build]
+target-dir = "C:/build/TLS-450-Plus-Snapshot-Audit-Log-Tool"

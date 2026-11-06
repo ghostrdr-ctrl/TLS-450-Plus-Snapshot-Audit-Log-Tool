@@ -1,0 +1,4 @@
+This repository is public. Every file in it is scanned by the pre-commit and
+pre-push guards for words that must never be published (personal names, the
+employer, customers, tool mentions), and commits must use the project identity.
+The pattern list lives outside the repository on purpose. Do not delete this file.
