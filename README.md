@@ -9,6 +9,8 @@ application log, auto events and the console's program log files.
 
 ## What it does
 
+- Shows which store the snapshot is from (the header set up on the console) and the console's
+  serial number and software.
 - Lists logins, logouts, setting changes and alarm acknowledgements with the user for each,
   and everything else the console logged, as 17 kinds of event.
 - Pick a time range, tick the kinds of event to show (each with a count), filter by user or

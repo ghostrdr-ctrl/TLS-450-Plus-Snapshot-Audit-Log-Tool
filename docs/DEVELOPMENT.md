@@ -71,6 +71,21 @@ repo's release downloads, with a SHA-256 (GitHub's asset digest, or the line the
 in the notes). Keep the asset name and that notes line when changing the workflow.
 Pre-releases are never offered.
 
+## Before a release
+
+The tests and screenshots don't click buttons or open other programs. Before tagging, run the
+built exe on Windows and check each of these by hand:
+
+- [ ] A snapshot opens: next to the exe at start, with **Open snapshot...**, and dragged onto the window.
+- [ ] The Store row shows the store; **Copy store info** pastes into Notepad.
+- [ ] **Save ... to .txt** writes a file that opens in Notepad and starts with the Store, Snapshot and
+      filter lines.
+- [ ] **Copy ... rows** pastes into Notepad, and into Excel as columns.
+- [ ] Right-click a row, **Show all events within 15 min**, then **Back to previous filters**.
+- [ ] **Check for updates** says it is up to date (or offers the newer release).
+- [ ] With an older exe: the update strip appears, **What's new** shows the notes, the link in it
+      opens the release page in the browser, and **Update and restart** replaces the exe and starts it.
+
 ## Icon
 
 `assets/app.ico` (stamped into the exe by `build.rs`) and `assets/icon-256.png`
@@ -105,6 +120,7 @@ A snapshot `.tar` holds more `.tgz` files; the program reads:
 | `databases.tgz` | The console's SQLite databases (`*.tls`). All times in them are Unix seconds, UTC. |
 | `etc.tgz` → `etc/timezone` | The console's zone, e.g. `TZ=":US/Mountain"`. US daylight-saving rules are applied by date. |
 | `opt_atg_logs.tgz` → `status.log` | Fallback zone: the last `=== 2026-11-05 15:30:03 -0700 ===` line (early ones can predate the zone being set). |
+| `opt_atg_distinfo.tgz` → `filelist.md5` | The console software, from its first lines (`# Release: 11.D`, `# Version: 400.15`). Only the first 4 KB is read. |
 
 | Database → table | Used for |
 |---|---|
@@ -113,6 +129,7 @@ A snapshot `.tar` holds more `.tgz` files; the program reads:
 | `AlarmDB` → `AlarmHistory` + `AlarmHistoryDetail` + `AlarmActionList` | Alarm rows. `AlarmHistory.EventID` = `AlarmHistoryDetail.ItemID`. Tank alarms (`DeviceType` 2) are named from the console's alarm list (1 = LEAK ALARM, ...). The New column holds `PostValue`. |
 | `SLDStatusDB` → `SLDHistory` | Static leak tests, a row at the start and one at the end (finished tests only; a test is saved when it ends). `StartMethod` 1 = manual, 5 = automatic. `TestType` 0/1/2 = 0.2 gph / 0.1 gph / gross; `LeakTestResult_1/_2/_3` hold that test's result (WSDL `LeakTestResult`). |
 | `TankSetupDB` → `TankSetup`, `LineSetupDB` → `LineSetup` | Tank and line labels (a PLLD `AnalyzerID` is its line number). |
+| `SiteStatusDB` → `HeaderSetup` | The store: `Header1` to `Header4` (the report header set up on the console; blank lines left out). The console serial number comes from the snapshot file name. |
 
 The other kinds are read by `src/snapshot/history.rs`, one function per table, with `select *` and
 columns looked up by name (a table that is absent gives no rows; one missing a needed column is

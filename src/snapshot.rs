@@ -145,6 +145,72 @@ pub struct Loaded {
     pub skipped: usize,
     /// Rows the console saved with no time, by `Kind::index`: not shown.
     pub no_time: [usize; Kind::COUNT],
+    /// The store the console is at, and the console itself.
+    pub site: Site,
+}
+
+/// Who and where: the store as set on the console (its report header) and the
+/// console's serial number and software.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Site {
+    /// The console's report header lines (store name, address, ...), blank
+    /// ones left out. Empty when no header was set up.
+    pub header: Vec<String>,
+    /// The console's serial number, from the snapshot file name.
+    pub serial: Option<String>,
+    /// The console software, e.g. "release 11.D, version 400.15".
+    pub software: Option<String>,
+}
+
+impl Site {
+    /// "Console serial A00000000023055, software release 11.D, version 400.15".
+    /// A serial not in the file name (it was renamed) is said to be unknown.
+    pub fn console(&self) -> String {
+        let serial = self.serial.as_deref().unwrap_or("unknown (not in the file name)");
+        let mut s = format!("Console serial {serial}");
+        if let Some(v) = &self.software {
+            s.push_str(&format!(", software {v}"));
+        }
+        s
+    }
+
+    /// The lines at the top of a saved .txt.
+    pub fn text_lines(&self) -> Vec<String> {
+        let mut out = vec![];
+        match self.header.split_first() {
+            None => out.push("Store: (no store header set up on this console)".to_string()),
+            Some((first, rest)) => {
+                out.push(format!("Store: {first}"));
+                out.extend(rest.iter().map(|l| format!("       {l}")));
+            }
+        }
+        out.push(self.console());
+        out
+    }
+}
+
+/// The serial number in a snapshot file name: "snapshot-A00000000023055-261021-1250.tar".
+fn serial_from_name(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy();
+    let rest = stem.strip_prefix("snapshot-")?;
+    let serial = rest.split('-').next()?;
+    (!serial.is_empty() && serial.len() <= 32 && serial.chars().all(|c| c.is_ascii_alphanumeric())).then(|| serial.to_string())
+}
+
+/// "release 11.D, version 400.15" from the "# Release:" and "# Version:"
+/// lines at the top of the console's file list.
+fn software_from_distinfo(head: &str) -> Option<String> {
+    let field = |key: &str| {
+        head.lines()
+            .find_map(|l| l.strip_prefix('#')?.trim().strip_prefix(key)?.strip_prefix(':').map(clean))
+            .filter(|v| !v.is_empty() && v.len() <= 40)
+    };
+    match (field("Release"), field("Version")) {
+        (Some(r), Some(v)) => Some(format!("release {r}, version {v}")),
+        (Some(r), None) => Some(format!("release {r}")),
+        (None, Some(v)) => Some(format!("version {v}")),
+        (None, None) => None,
+    }
 }
 
 /// What the readers share: the clock and the console's names for its devices.
@@ -433,9 +499,27 @@ pub fn load(tar_path: &Path) -> Result<Loaded, String> {
     // Everything else the console keeps; a site without a feature has no rows.
     history::read_all(&ex, &ctx, &mut out);
 
+    // The store header: one row, four lines of up to 21 characters.
+    let header = lookup(
+        &ex.db("SiteStatusDB.tls"),
+        "select Header1, Header2, Header3, Header4 from HeaderSetup order by ItemID limit 1",
+        |r| Ok((0..4).map(|i| clean(&text(r, i))).collect::<Vec<_>>()),
+    )
+    .and_then(|v| v.into_iter().next())
+    .unwrap_or_default()
+    .into_iter()
+    .filter(|l| !l.is_empty())
+    .collect();
+    let site = Site {
+        header,
+        serial: serial_from_name(tar_path),
+        software: ex.distinfo.as_deref().and_then(software_from_distinfo),
+    };
+
     let mut rows = out.rows;
     rows.sort_by_key(|r| r.utc);
     Ok(Loaded {
+        site,
         path: tar_path.to_path_buf(),
         clock: ctx.clock,
         rows,
@@ -453,6 +537,8 @@ struct Extracted {
     status_log: Option<String>,
     timezone: Option<String>,
     wsdl: Option<String>,
+    /// The start of the console's file list (opt/atg/distinfo), which names its software.
+    distinfo: Option<String>,
     /// Program log files (opt/atg/logs, not status.log): (file name, text),
     /// rotated `.gz` copies unpacked.
     logs: Vec<(String, String)>,
@@ -488,6 +574,7 @@ impl Extracted {
             status_log: None,
             timezone: None,
             wsdl: None,
+            distinfo: None,
             logs: vec![],
         };
 
@@ -499,7 +586,10 @@ impl Extracted {
         for entry in entries {
             let mut entry = entry.map_err(|_| "This file is not a snapshot .tar (or it is damaged).".to_string())?;
             let name = base_name(&entry.path().map_err(|e| e.to_string())?.to_string_lossy());
-            if !matches!(name.as_str(), "databases.tgz" | "opt_atg_logs.tgz" | "etc.tgz" | "opt_atg_etc.tgz") {
+            if !matches!(
+                name.as_str(),
+                "databases.tgz" | "opt_atg_logs.tgz" | "etc.tgz" | "opt_atg_etc.tgz" | "opt_atg_distinfo.tgz"
+            ) {
                 continue;
             }
             let mut inner = tar::Archive::new(GzDecoder::new(&mut entry));
@@ -556,6 +646,12 @@ impl Extracted {
                     ex.timezone = read_capped(&mut e, 4096);
                 } else if name == "opt_atg_etc.tgz" && n == "TLSWebService.wsdl" {
                     ex.wsdl = read_capped(&mut e, MAX_TEXT_BYTES);
+                } else if name == "opt_atg_distinfo.tgz" && n == "filelist.md5" && ex.distinfo.is_none() {
+                    // Only its first lines matter; the rest is a long list of files.
+                    let mut buf = vec![];
+                    if (&mut e).take(4096).read_to_end(&mut buf).is_ok() {
+                        ex.distinfo = Some(String::from_utf8_lossy(&buf).into_owned());
+                    }
                 }
             }
         }
@@ -929,6 +1025,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn site_serial_and_software() {
+        assert_eq!(
+            serial_from_name(Path::new("C:/x/snapshot-A00000000012345-261021-1250.tar")).as_deref(),
+            Some("A00000000012345")
+        );
+        assert_eq!(serial_from_name(Path::new("my copy.tar")), None);
+        assert_eq!(serial_from_name(Path::new("snapshot-../x.tar")), None);
+        let head = "# Date: 2026-04-03 01:11:38 UTC\n# Release: 11.D\n# Version: 400.15\nabc  opt/x\n";
+        assert_eq!(software_from_distinfo(head).as_deref(), Some("release 11.D, version 400.15"));
+        assert_eq!(software_from_distinfo("abc  opt/x\n"), None);
+    }
+
+    #[test]
+    fn site_text_lines() {
+        let s = Site {
+            header: vec!["EXAMPLE STORE 12".into(), "100 MAIN ST".into()],
+            serial: Some("A1".into()),
+            software: Some("release 11.D, version 400.15".into()),
+        };
+        assert_eq!(
+            s.text_lines(),
+            [
+                "Store: EXAMPLE STORE 12",
+                "       100 MAIN ST",
+                "Console serial A1, software release 11.D, version 400.15"
+            ]
+        );
+        let none = Site::default();
+        assert_eq!(
+            none.text_lines(),
+            [
+                "Store: (no store header set up on this console)",
+                "Console serial unknown (not in the file name)"
+            ]
+        );
+    }
+
+    #[test]
     fn hostile_input_is_refused_not_panicked_on() {
         assert_eq!(offset_from_status("=== 2026-11-05 15:30:03 +0\u{e9}0 ==="), None);
         assert_eq!(offset_from_status("=== 2026-11-05 15:30:03 +0130 ==="), Some(5400));
@@ -1030,6 +1164,9 @@ mod tests {
         let p = std::env::var("TLS450_SNAPSHOT").expect("set TLS450_SNAPSHOT");
         let d = load(Path::new(&p)).unwrap();
         assert!(!d.rows.is_empty());
+        for l in d.site.text_lines() {
+            println!("{l}");
+        }
         for k in Kind::ALL {
             let of: Vec<&Row> = d.rows.iter().filter(|r| r.kind == k).collect();
             println!("== {} ({}, {} with no time)", k.name(), of.len(), d.no_time[k.index()]);

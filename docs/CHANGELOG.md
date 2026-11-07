@@ -9,6 +9,13 @@ punctuation only.
 
 Newest first. Each heading is `## <version>` and must match `version` in `Cargo.toml`.
 
+## 0.5.0
+
+- The store the snapshot is from: its header (name, address) as set up on the console, and the
+  console's serial number and software, at the top of the window and of a saved .txt.
+- "What's new" now shows the release notes in a window. It and "Open download page" did
+  nothing before, because the program could not open web pages.
+
 ## 0.4.0
 
 - Every log in the snapshot, not just the audit trail, alarms and static leak tests: log

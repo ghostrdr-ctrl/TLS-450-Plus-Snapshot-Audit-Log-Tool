@@ -196,6 +196,8 @@ struct App {
     auto_opened: bool,
     focus_search: bool,
     update: UpdateState,
+    /// The "What's new" window (release notes of the offered update) is open.
+    show_notes: bool,
     #[cfg(feature = "review-shots")]
     shots: Option<shots::Shots>,
 }
@@ -259,6 +261,7 @@ impl App {
             auto_opened: false,
             focus_search: false,
             update: UpdateState::Idle,
+            show_notes: false,
             #[cfg(feature = "review-shots")]
             shots: shots::Shots::from_env(),
         };
@@ -406,18 +409,49 @@ impl App {
         }
     }
 
+    /// The release notes of the offered update, in a window of their own.
+    fn notes_window(&mut self, ctx: &egui::Context) {
+        let UpdateState::Available(r) = &self.update else {
+            self.show_notes = false;
+            return;
+        };
+        if !self.show_notes {
+            return;
+        }
+        let notes = r.notes.trim();
+        let mut open = true;
+        egui::Window::new(format!("What's new in {}", r.version))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(380.0)
+            // Below the update strip and toolbar, so the strip's buttons stay in view.
+            .pivot(egui::Align2::CENTER_TOP)
+            .default_pos(ctx.content_rect().center_top() + egui::vec2(0.0, 140.0))
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(ui.available_height() - 32.0)
+                    .show(ui, |ui| {
+                        if notes.is_empty() {
+                            ui.weak("This release has no notes.");
+                        } else {
+                            notes_view(ui, notes);
+                        }
+                    });
+                ui.separator();
+                ui.hyperlink_to("Open the release page in a browser", update::RELEASES_PAGE);
+            });
+        if !open {
+            self.show_notes = false;
+        }
+    }
+
     /// The strip above the toolbar while an update is offered or running.
     fn update_strip(&mut self, ui: &mut egui::Ui) {
         let mut next: Option<UpdateState> = None;
         let mut install: Option<update::Release> = None;
-        let notes_tip = |r: &update::Release| {
-            let n: String = r.notes.trim().chars().take(1500).collect();
-            if n.is_empty() {
-                "Opens the release page".to_string()
-            } else {
-                format!("{n}\n\nClick to open the release page.")
-            }
-        };
         ui.horizontal_wrapped(|ui| match &self.update {
             UpdateState::Available(r) => {
                 ui.label(RichText::new(format!("Version {} is available", r.version)).strong().color(BLUE));
@@ -433,10 +467,15 @@ impl App {
                 } else if ui.button("Open download page").clicked() {
                     ui.ctx().open_url(egui::OpenUrl::new_tab(update::RELEASES_PAGE));
                 }
-                if ui.button("What's new").on_hover_text(notes_tip(r)).clicked() {
-                    ui.ctx().open_url(egui::OpenUrl::new_tab(update::RELEASES_PAGE));
+                if ui
+                    .selectable_label(self.show_notes, "What's new")
+                    .on_hover_text("Show the release notes of this version")
+                    .clicked()
+                {
+                    self.show_notes = !self.show_notes;
                 }
                 if ui.button("Later").clicked() {
+                    self.show_notes = false;
                     next = Some(UpdateState::Idle);
                 }
             }
@@ -855,7 +894,12 @@ impl App {
         let n = rows.len();
         let kind = if self.selected.is_empty() { "rows" } else { "selected rows" };
         // What the rows are: the snapshot and the filters that picked them.
-        let mut head = format!("Snapshot: {}\r\n", file_name(&d.path));
+        let mut head = String::new();
+        for l in d.site.text_lines() {
+            head.push_str(&l);
+            head.push_str("\r\n");
+        }
+        head.push_str(&format!("Snapshot: {}\r\n", file_name(&d.path)));
         head.push_str(&format!("Times: console local, {}\r\n", d.clock.zone()));
         for l in self.filter_lines() {
             head.push_str(&l);
@@ -1098,6 +1142,48 @@ fn natural_key(s: &str) -> Vec<(String, String)> {
     natural_key_str(&s.to_lowercase())
 }
 
+/// The store the snapshot is from, on two lines beside the "Store" label: the
+/// console's report header (name in bold, then the address), and under it the
+/// console's serial number and software, with a Copy button.
+/// True when its Copy button was clicked.
+fn store_row(ui: &mut egui::Ui, site: &snapshot::Site) -> bool {
+    let mut copied = false;
+    // Lighter than body text, still readable in both themes.
+    let soft = ui.visuals().text_color().gamma_multiply(0.85);
+    ui.horizontal_top(|ui| {
+        row_label(ui, "Store");
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                match site.header.split_first() {
+                    None => {
+                        ui.label(RichText::new("No store header set up on this console").italics().color(soft));
+                    }
+                    Some((first, rest)) => {
+                        ui.label(RichText::new(first).strong().size(15.0));
+                        if !rest.is_empty() {
+                            ui.label(rest.join(", "));
+                        }
+                    }
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(site.console()).color(soft));
+                if ui
+                    .small_button("Copy store info")
+                    .on_hover_text("Copies these lines, as at the top of a saved .txt")
+                    .clicked()
+                {
+                    ui.ctx().copy_text(site.text_lines().join("\r\n"));
+                    copied = true;
+                }
+            });
+        });
+    });
+    ui.add_space(6.0);
+    copied
+}
+
 fn row_label(ui: &mut egui::Ui, text: &str) {
     let h = ui.spacing().interact_size.y;
     ui.allocate_ui_with_layout(egui::vec2(ROW_LABEL_W, h), Layout::left_to_right(Align::Center), |ui| {
@@ -1119,6 +1205,56 @@ fn time_box(ui: &mut egui::Ui, value: &mut String, state: BoxState) -> bool {
             .rect_stroke(r.rect, 2.0, egui::Stroke::new(1.5, RED), egui::StrokeKind::Outside);
     }
     r.changed()
+}
+
+/// Release notes (GitHub Markdown) as plain text: headings bold, bullets as
+/// dots, emphasis and code marks dropped, links shown by their text.
+fn notes_view(ui: &mut egui::Ui, notes: &str) {
+    for line in notes.lines() {
+        let t = line.trim_end();
+        let indent = (t.len() - t.trim_start().len()) as f32 * 4.0;
+        let t = t.trim_start();
+        if t.is_empty() {
+            ui.add_space(4.0);
+        } else if let Some(h) = t.strip_prefix('#') {
+            ui.add_space(4.0);
+            ui.label(RichText::new(md_plain(h.trim_start_matches('#').trim())).strong().size(15.0));
+        } else if let Some(b) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(indent);
+                ui.label("\u{2022}");
+                ui.label(md_plain(b));
+            });
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(indent);
+                ui.label(md_plain(t));
+            });
+        }
+    }
+}
+
+/// Markdown inline marks removed: `**`, `__`, backticks, and `[text](url)`
+/// shown as its text.
+fn md_plain(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('[') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        match after.find("](").and_then(|j| after[j + 2..].find(')').map(|k| (j, j + 2 + k))) {
+            Some((j, end)) => {
+                out.push_str(&after[..j]);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('[');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.replace("**", "").replace("__", "").replace('`', "")
 }
 
 /// The Source tag's color, one per kind (hues close within a group). None:
@@ -1503,6 +1639,11 @@ impl App {
                 ui.painter().rect_stroke(r.rect, 3.0, sel_stroke, egui::StrokeKind::Inside);
             }
         };
+        if let Some(d) = &self.data
+            && store_row(ui, &d.site)
+        {
+            self.message = Message::Good("Copied the store info".into());
+        }
         ui.horizontal_wrapped(|ui| {
             if ui.button("Open snapshot...").on_hover_text("Ctrl+O").clicked() {
                 self.pick_and_open();
@@ -1855,6 +1996,7 @@ impl eframe::App for App {
                 });
             });
         }
+        self.notes_window(&ctx);
         egui::Panel::top("controls").show(ui, |ui| {
             egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 8)).show(ui, |ui| {
                 self.toolbar(ui, &ctx);
@@ -2219,6 +2361,14 @@ fn scroll_done(app: &App) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_notes_lose_markdown_marks() {
+        assert_eq!(super::md_plain("**Bold** and `code`"), "Bold and code");
+        assert_eq!(super::md_plain("See [the page](https://x.y/z) now"), "See the page now");
+        assert_eq!(super::md_plain("a [b c"), "a [b c");
+        assert_eq!(super::md_plain("[x](u"), "[x](u");
+    }
+
     use super::*;
 
     fn row(time: &str, user: &str, event: &str, value: &str) -> Row {

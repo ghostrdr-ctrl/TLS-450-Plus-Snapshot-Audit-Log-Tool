@@ -161,7 +161,14 @@ const STATES: &[(&str, Setup)] = &[
             }),
         });
     }),
+    ("12c2-whats-new", |a, _| {
+        if let crate::UpdateState::Available(r) = &mut a.update {
+            r.notes = "## What's new\n\n- **Every log** in the snapshot: line tests, `PLLD` results, deliveries.\n- A Show panel to pick the kinds.\n  - Nested point\n\nSee [the guide](https://example.com) for more.\n\nSHA-256: 0123abcd".into();
+        }
+        a.show_notes = true;
+    }),
     ("12d-update-failed", |a, _| {
+        a.show_notes = false;
         let crate::UpdateState::Available(r) = std::mem::replace(&mut a.update, crate::UpdateState::Idle) else {
             return;
         };
@@ -169,6 +176,13 @@ const STATES: &[(&str, Setup)] = &[
             release: r,
             error: "the download does not match its published SHA-256".into(),
         };
+    }),
+    ("12e-no-store-header", |a, _| {
+        a.update = crate::UpdateState::Idle;
+        if let Some(d) = &mut a.data {
+            d.site.header.clear();
+            d.site.serial = None;
+        }
     }),
     ("13-no-snapshot-open", |a, ctx| {
         ctx.set_theme(egui::Theme::Dark);

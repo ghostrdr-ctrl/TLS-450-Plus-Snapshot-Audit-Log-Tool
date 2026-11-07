@@ -374,6 +374,22 @@ pub fn swap_in(exe: &Path, new_file: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Without eframe's "links" feature, opening a web page (release notes,
+    /// download page) silently does nothing. Nothing else would catch that.
+    #[test]
+    fn eframe_can_open_web_pages() {
+        let toml = include_str!("../Cargo.toml");
+        let eframe = toml
+            .lines()
+            .find(|l| l.trim_start().starts_with("eframe ="))
+            .expect("eframe in Cargo.toml");
+        let default_off = eframe.contains("default-features = false");
+        assert!(
+            !default_off || eframe.contains("\"links\""),
+            "eframe needs the \"links\" feature: {eframe}"
+        );
+    }
+
     fn v(s: &str) -> SemVer {
         SemVer::parse(s).unwrap_or_else(|| panic!("{s}"))
     }
